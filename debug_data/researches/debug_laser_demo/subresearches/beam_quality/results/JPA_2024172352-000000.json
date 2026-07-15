@@ -1,0 +1,1 @@
+{"similarity":2,"concept_level":3,"tech_cluster":"品質予測モデル","problem_cluster":"加工後まで欠陥が分からない","tech_summary":"加工ログから欠陥確率を予測し、品質判定を支援する。","problem_summary":"検査が後工程となり不良を加工中に抑制できない。","reasoning":"予測は関連しますが、照射条件の直接制御が弱いため周辺特許として扱います。"}

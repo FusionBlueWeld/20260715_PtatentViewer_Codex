@@ -1,0 +1,1 @@
+{"similarity":4,"concept_level":3,"tech_cluster":"ビーム形状可変制御","problem_cluster":"加工対象に応じた熱分布を作れない","tech_summary":"光学素子を制御してビーム分布を加工中に変更する。","problem_summary":"固定ビームでは材質や形状ごとの適切な熱入力を維持できない。","reasoning":"ビーム制御は近いものの、光学構成の限定により回避可能性があります。"}

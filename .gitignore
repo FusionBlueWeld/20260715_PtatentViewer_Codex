@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+runtime/
+*.log
+
+# Local patent documents (keep only the repository placeholder)
+patent_pool/*
+!patent_pool/.gitkeep
+
+# Previous implementation and superseded reference specifications
+old_source/
+SYSTEM_SPECIFICATION.md
+ui-collaboration-design.md
+
+# Generated research/LLM artifacts
+researches/**/results/
+researches/**/runs/
+debug_data/researches/debug_llm_single/**/results/
+debug_data/researches/debug_llm_single/**/runs/
+
+# Editor, OS and temporary files
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+*.swp

@@ -1,0 +1,398 @@
+from __future__ import annotations
+
+import argparse
+import hmac
+import json
+import mimetypes
+import os
+import threading
+import time
+import uuid
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+from .domain import DataError, Repository
+
+
+PROTOCOL_ACTIONS = ("click", "input", "check", "keydown", "select", "wait", "assert")
+TERMINAL = {"completed", "failed", "cancelled"}
+
+
+class AppState:
+    def __init__(self, root: Path, idle_timeout: float = 1800, control_token: str = ""):
+        self.root = root.resolve()
+        self.repo = Repository(self.root)
+        self.environment = "normal"
+        self.idle_timeout = max(0.2, float(idle_timeout))
+        self.control_token = control_token
+        self.last_activity = time.time()
+        self.last_user_event_at = 0.0
+        self.clients: dict[str, dict] = {}
+        self.commands: dict[str, dict] = {}
+        self.activity: list[dict] = []
+        self.lock = threading.RLock()
+        self.server = None
+
+    def log(self, event: str, **detail):
+        item = {"at": time.time(), "event": event, **detail}
+        self.activity.append(item)
+        self.activity[:] = self.activity[-300:]
+
+    def touch(self, source: str) -> None:
+        with self.lock:
+            self.last_activity = time.time()
+            self.log("activity", source=source)
+
+    def idle_remaining(self) -> float:
+        with self.lock:
+            return max(0.0, self.idle_timeout - (time.time() - self.last_activity))
+
+    def start_idle_monitor(self) -> None:
+        def monitor():
+            interval = min(5.0, max(0.1, self.idle_timeout / 5))
+            while self.server is not None:
+                time.sleep(interval)
+                if self.idle_remaining() <= 0:
+                    self.log("idle_shutdown", idle_timeout=self.idle_timeout)
+                    self.server.shutdown()
+                    return
+
+        threading.Thread(target=monitor, name="patent-viewer-idle-monitor", daemon=True).start()
+
+
+class PatentViewerHandler(BaseHTTPRequestHandler):
+    server_version = "PatentViewer/0.1"
+
+    @property
+    def state(self) -> AppState:
+        return self.server.app_state  # type: ignore[attr-defined]
+
+    def log_message(self, fmt, *args):
+        if getattr(self.server, "quiet", False):
+            return
+        super().log_message(fmt, *args)
+
+    def _json(self, status: int, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > 1_000_000:
+            raise DataError("リクエストが大きすぎます")
+        try:
+            return json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError as exc:
+            raise DataError("JSONが不正です") from exc
+
+    def _file(self, path: Path, content_type: str | None = None):
+        data = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _error(self, exc: Exception):
+        status = HTTPStatus.NOT_FOUND if "見つかりません" in str(exc) else HTTPStatus.BAD_REQUEST
+        self._json(status, {"error": str(exc)})
+
+    def do_GET(self):
+        try:
+            self._get()
+        except (DataError, OSError) as exc:
+            self._error(exc)
+
+    def _get(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        query = parse_qs(parsed.query)
+        if path == "/api/health":
+            return self._json(200, {
+                "ok": True,
+                "environment": self.state.environment,
+                "version": "0.2.0",
+                "idle_timeout_seconds": self.state.idle_timeout,
+                "idle_remaining_seconds": round(self.state.idle_remaining(), 1),
+            })
+        if path not in {"/api/ui/next"}:
+            self.state.touch(f"GET {path}")
+        if path == "/api/environment":
+            return self._json(200, {"environment": self.state.environment})
+        if path == "/api/researches":
+            env = query.get("environment", [self.state.environment])[0]
+            return self._json(200, {"environment": env, "items": self.state.repo.list_researches(env)})
+        if path.startswith("/api/researches/") and path.endswith("/dashboard"):
+            research_id = path.split("/")[3]
+            env = query.get("environment", [self.state.environment])[0]
+            return self._json(200, self.state.repo.dashboard(env, research_id))
+        if path.startswith("/api/researches/") and path.endswith("/llm-preflight"):
+            research_id = path.split("/")[3]
+            env = query.get("environment", [self.state.environment])[0]
+            return self._json(200, self.state.repo.preflight(env, research_id))
+        if path.startswith("/api/pdfs/"):
+            pdf_name = path.removeprefix("/api/pdfs/")
+            return self._file(self.state.repo.pdf_path(pdf_name), "application/pdf")
+        if path == "/api/ui-protocol":
+            return self._json(200, {"version": 1, "actions": PROTOCOL_ACTIONS, "max_actions": 100, "same_visible_dom": True})
+        if path == "/api/ui/clients":
+            now = time.time()
+            with self.state.lock:
+                items = [c for c in self.state.clients.values() if now - c["heartbeat_at"] < 20]
+            return self._json(200, {"items": items})
+        if path == "/api/ui/next":
+            return self._claim_next(query.get("clientId", [""])[0])
+        if path.startswith("/api/ui/commands/") and path.endswith("/control"):
+            command = self._command(path.split("/")[4])
+            return self._json(200, {"command_id": command["id"], "control": command["control"]})
+        if path.startswith("/api/ui/commands/"):
+            return self._json(200, self._command(path.split("/")[4]))
+        if path == "/api/ui/activity":
+            return self._json(200, {"items": list(reversed(self.state.activity[-100:]))})
+        return self._static(path)
+
+    def _static(self, path: str):
+        relative = "index.html" if path == "/" else path.lstrip("/")
+        public = (self.state.root / "public").resolve()
+        target = (public / relative).resolve()
+        if target != public and public not in target.parents:
+            raise DataError("不正なパスです")
+        if not target.is_file():
+            raise DataError("ファイルが見つかりません")
+        return self._file(target)
+
+    def do_POST(self):
+        try:
+            self._post()
+        except (DataError, OSError) as exc:
+            self._error(exc)
+
+    def _post(self):
+        path = urlparse(self.path).path
+        body = self._body()
+        if path == "/api/admin/shutdown":
+            return self._shutdown()
+        if path != "/api/ui/clients/heartbeat":
+            self.state.touch(f"POST {path}")
+        if path == "/api/environment":
+            env = body.get("environment")
+            self.state.repo.paths(env)
+            self.state.environment = env
+            self.state.log("environment_changed", environment=env)
+            return self._json(200, {"environment": env, "reload_required": True})
+        if path == "/api/interpretations":
+            env = body.get("environment", self.state.environment)
+            if env != self.state.environment:
+                return self._json(409, {"error": "画面とサーバーの環境が一致しません"})
+            if body.get("source") == "codex" and not self._authorized_codex(env):
+                return self._json(403, {"error": "Codexの保存は実行中の可視UIコマンドが必要です"})
+            target = self.state.repo.save_interpretation(env, body)
+            self.state.log("interpretation_saved", environment=env, patent_id=body.get("patent_id"))
+            return self._json(201, {"ok": True, "path": str(target.relative_to(self.state.root))})
+        if path == "/api/ui/clients/heartbeat":
+            return self._heartbeat(body)
+        if path == "/api/ui/commands":
+            return self._create_command(body)
+        if path.startswith("/api/ui/commands/") and path.endswith("/events"):
+            return self._command_event(path.split("/")[4], body)
+        if path.startswith("/api/ui/commands/") and path.endswith("/control"):
+            return self._control(path.split("/")[4], body)
+        raise DataError("APIが見つかりません")
+
+    def _heartbeat(self, body):
+        client_id = str(body.get("clientId", ""))
+        if not client_id or len(client_id) > 100:
+            raise DataError("clientIdが不正です")
+        targets = body.get("targets", [])
+        if not isinstance(targets, list) or len(targets) > 500:
+            raise DataError("targetsが不正です")
+        user_active_at = body.get("userActiveAt")
+        if isinstance(user_active_at, (int, float)):
+            user_active_at = float(user_active_at) / 1000.0
+            now = time.time()
+            if self.state.last_user_event_at < user_active_at <= now + 5:
+                self.state.last_user_event_at = user_active_at
+                self.state.touch("browser_user_event")
+        client = {
+            "clientId": client_id,
+            "url": str(body.get("url", ""))[:500],
+            "title": str(body.get("title", ""))[:200],
+            "module": str(body.get("module", "patent-viewer"))[:100],
+            "environment": self.state.environment,
+            "capabilities": body.get("capabilities", []),
+            "targets": targets,
+            "currentCommandId": body.get("currentCommandId"),
+            "heartbeat_at": time.time(),
+        }
+        with self.state.lock:
+            self.state.clients[client_id] = client
+        return self._json(200, {"ok": True, "environment": self.state.environment})
+
+    def _shutdown(self):
+        supplied = self.headers.get("X-PatentViewer-Control-Token", "")
+        local = self.client_address[0] in {"127.0.0.1", "::1"}
+        if not local or not self.state.control_token or not hmac.compare_digest(supplied, self.state.control_token):
+            return self._json(403, {"error": "shutdown authorization failed"})
+        self.state.log("manual_shutdown")
+        self._json(202, {"ok": True, "status": "stopping"})
+        threading.Thread(target=self.server.shutdown, name="patent-viewer-shutdown", daemon=True).start()
+
+    def _create_command(self, body):
+        actor = body.get("actor", "codex")
+        client_id = body.get("targetClientId")
+        actions = body.get("actions")
+        if actor != "codex" or not str(body.get("intent", "")).strip():
+            raise DataError("actor=codexとintentが必要です")
+        if not isinstance(actions, list) or not 1 <= len(actions) <= 100:
+            raise DataError("actionsは1〜100件です")
+        if any(a.get("type") not in PROTOCOL_ACTIONS for a in actions):
+            raise DataError("未対応のactionがあります")
+        with self.state.lock:
+            client = self.state.clients.get(client_id)
+            if not client or time.time() - client["heartbeat_at"] >= 20:
+                raise DataError("対象clientが見つかりません")
+            command_id = uuid.uuid4().hex
+            command = {
+                "id": command_id,
+                "actor": actor,
+                "intent": str(body["intent"])[:500],
+                "targetClientId": client_id,
+                "environment": self.state.environment,
+                "module": client["module"],
+                "actions": actions,
+                "status": "queued",
+                "control": "run",
+                "claimedBy": None,
+                "created_at": time.time(),
+                "events": [],
+            }
+            self.state.commands[command_id] = command
+            self.state.log("command_queued", command_id=command_id, intent=command["intent"])
+        return self._json(201, command)
+
+    def _claim_next(self, client_id):
+        with self.state.lock:
+            client = self.state.clients.get(client_id)
+            if not client or time.time() - client["heartbeat_at"] >= 20:
+                raise DataError("clientが見つかりません")
+            for command in self.state.commands.values():
+                if command["status"] == "queued" and command["targetClientId"] == client_id:
+                    if command["environment"] != self.state.environment:
+                        command["status"] = "failed"
+                        command["events"].append({"type": "failed", "error": "environment changed", "at": time.time()})
+                        continue
+                    command["status"] = "running"
+                    command["claimedBy"] = client_id
+                    self.state.log("command_claimed", command_id=command["id"], client_id=client_id)
+                    return self._json(200, {"command": command})
+        return self._json(200, {"command": None})
+
+    def _command(self, command_id):
+        with self.state.lock:
+            command = self.state.commands.get(command_id)
+            if not command:
+                raise DataError("コマンドが見つかりません")
+            return command
+
+    def _command_event(self, command_id, body):
+        with self.state.lock:
+            command = self._command(command_id)
+            if command["claimedBy"] != body.get("clientId"):
+                return self._json(403, {"error": "claimしたclientではありません"})
+            event_type = body.get("type")
+            allowed = {"started", "step_started", "step_completed", "completed", "failed", "cancelled"}
+            if event_type not in allowed:
+                raise DataError("event typeが不正です")
+            event = {k: v for k, v in body.items() if k != "clientId"}
+            event["at"] = time.time()
+            command["events"].append(event)
+            if event_type in TERMINAL:
+                command["status"] = event_type
+                command["control"] = "run"
+            self.state.log("command_event", command_id=command_id, type=event_type)
+        return self._json(200, {"ok": True, "status": command["status"]})
+
+    def _control(self, command_id, body):
+        value = body.get("control")
+        if value not in {"run", "pause", "cancel"}:
+            raise DataError("controlが不正です")
+        with self.state.lock:
+            command = self._command(command_id)
+            if command["status"] in TERMINAL:
+                raise DataError("終端コマンドは制御できません")
+            command["control"] = value
+            self.state.log("command_control", command_id=command_id, control=value)
+        return self._json(200, {"ok": True, "control": value})
+
+    def _authorized_codex(self, environment):
+        command_id = self.headers.get("X-PatentViewer-UI-Command", "")
+        client_id = self.headers.get("X-PatentViewer-UI-Client", "")
+        with self.state.lock:
+            command = self.state.commands.get(command_id)
+            client = self.state.clients.get(client_id)
+            return bool(
+                command and client
+                and command["actor"] == "codex"
+                and command["status"] == "running"
+                and command["claimedBy"] == client_id
+                and command["environment"] == environment == self.state.environment
+                and command["module"] == client["module"] == "patent-viewer"
+                and time.time() - client["heartbeat_at"] < 20
+            )
+
+
+def create_server(root: Path, host="127.0.0.1", port=8765, quiet=False, idle_timeout=1800, control_token=""):
+    server = ThreadingHTTPServer((host, port), PatentViewerHandler)
+    server.app_state = AppState(root, idle_timeout=idle_timeout, control_token=control_token)  # type: ignore[attr-defined]
+    server.app_state.server = server  # type: ignore[attr-defined]
+    server.quiet = quiet  # type: ignore[attr-defined]
+    server.app_state.start_idle_monitor()  # type: ignore[attr-defined]
+    return server
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PatentViewer local server")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--idle-timeout", type=float, default=1800, help="seconds without user/Codex activity before shutdown")
+    parser.add_argument("--control-file", type=Path)
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args()
+    control_token = uuid.uuid4().hex
+    server = create_server(args.root, args.host, args.port, quiet=args.quiet, idle_timeout=args.idle_timeout, control_token=control_token)
+    control_file = (args.control_file or (args.root / "runtime/server-control.json")).resolve()
+    control_file.parent.mkdir(parents=True, exist_ok=True)
+    control_payload = {
+        "pid": os.getpid(), "host": args.host, "port": args.port,
+        "url": f"http://{args.host}:{args.port}", "token": control_token,
+        "idle_timeout_seconds": args.idle_timeout, "started_at": time.time(),
+    }
+    temp_control = control_file.with_suffix(".tmp")
+    temp_control.write_text(json.dumps(control_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp_control, control_file)
+    print(f"PatentViewer: http://{args.host}:{args.port}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        try:
+            current = json.loads(control_file.read_text(encoding="utf-8"))
+            if current.get("token") == control_token:
+                control_file.unlink()
+        except (OSError, json.JSONDecodeError):
+            pass
+
+
+if __name__ == "__main__":
+    main()

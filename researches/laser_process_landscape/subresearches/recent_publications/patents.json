@@ -1,0 +1,16 @@
+{
+  "name": "直近公開公報",
+  "description": "2025〜2026年に公開された文献の初期調査リスト",
+  "patents": [
+    {"pdf":"JPA 2026070800-000000.pdf","applicant":"未調査","category":"競合公開","tags":["2026","公開"]},
+    {"pdf":"JPA 2026069331-000000.pdf","applicant":"未調査","category":"競合公開","tags":["2026","公開"]},
+    {"pdf":"JPA 2026066788-000000.pdf","applicant":"未調査","category":"競合公開","tags":["2026","公開"]},
+    {"pdf":"JPA 2026066097-000000.pdf","applicant":"未調査","category":"競合公開","tags":["2026","公開"]},
+    {"pdf":"JPA 2026064517-000000.pdf","applicant":"未調査","category":"競合公開","tags":["2026","公開"]},
+    {"pdf":"JPA 2026063466-000000.pdf","applicant":"未調査","category":"競合公開","tags":["2026","公開"]},
+    {"pdf":"JPA 2025184591-000000.pdf","applicant":"未調査","category":"競合公開","tags":["2025","公開"]},
+    {"pdf":"JPA 2025184502-000000.pdf","applicant":"未調査","category":"競合公開","tags":["2025","公開"]},
+    {"pdf":"JPA 2025184404-000000.pdf","applicant":"未調査","category":"競合公開","tags":["2025","公開"]},
+    {"pdf":"JPA 2025184180-000000.pdf","applicant":"未調査","category":"競合公開","tags":["2025","公開"]}
+  ]
+}

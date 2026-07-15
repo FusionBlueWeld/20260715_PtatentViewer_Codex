@@ -1,0 +1,1 @@
+{"similarity":4,"concept_level":5,"tech_cluster":"光学フィードバック制御","problem_cluster":"加工状態を即時把握できない","tech_summary":"溶融池画像から状態を推定し、加工パラメータを制御する。","problem_summary":"温度と形状の急変に事前設定だけでは対応できない。","reasoning":"制御ループは近く、上位概念の請求項を優先確認する価値があります。"}

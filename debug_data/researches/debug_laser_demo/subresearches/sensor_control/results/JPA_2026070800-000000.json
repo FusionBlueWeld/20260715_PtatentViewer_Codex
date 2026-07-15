@@ -1,0 +1,1 @@
+{"similarity":5,"concept_level":4,"tech_cluster":"光学フィードバック制御","problem_cluster":"加工状態を即時把握できない","tech_summary":"加工光を検出して状態量を推定し、照射出力を逐次補正する。","problem_summary":"加工中の変化を固定条件では追従できず、品質がばらつく。","reasoning":"閉ループ構成が自社技術と強く重なり、請求項のセンサ種別限定を確認すべき候補です。"}

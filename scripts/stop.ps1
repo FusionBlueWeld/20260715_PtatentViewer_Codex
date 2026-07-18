@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $controlFile = Join-Path $projectRoot 'runtime\server-control.json'
 
 if (-not (Test-Path -LiteralPath $controlFile)) {

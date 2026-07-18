@@ -21,5 +21,11 @@ def build_fixture(root: Path):
             "tech_summary": "fixture tech", "problem_summary": "fixture problem", "reasoning": "fixture reason"
         }
         (base / f"subresearches/sample/results/{key}.json").write_text(json.dumps(result), encoding="utf-8")
-    prompt_dir = root / "src/patent_viewer/prompts"; prompt_dir.mkdir(parents=True)
-    for index in range(7): (prompt_dir / f"p{index}.txt").write_text("prompt", encoding="utf-8")
+    prompt_dir = root / "src/patent_viewer/prompts/stages"; prompt_dir.mkdir(parents=True)
+    for name in ("similarity", "concept_level", "problem_summary", "technology_summary", "cluster_name"):
+        (prompt_dir / f"{name}.txt").write_text("prompt", encoding="utf-8")
+    schema_dir = root / "schemas"; schema_dir.mkdir(parents=True)
+    for name in ("similarity", "concept-level", "problem-summary", "technology-summary", "cluster-name"):
+        (schema_dir / f"llm-{name}.schema.json").write_text(json.dumps({
+            "type": "object", "required": ["value"], "properties": {"value": {"type": "string"}}
+        }), encoding="utf-8")

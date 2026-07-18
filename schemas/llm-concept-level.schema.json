@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local LLM claim breadth assessment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["concept_level", "reason"],
+  "properties": {
+    "concept_level": {"type": "integer", "minimum": 1, "maximum": 5},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 800}
+  }
+}

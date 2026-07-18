@@ -3,7 +3,7 @@
   "description": "Ollamaを実行する単一文献。結果生成前はpending、成功後はreadyになる。",
   "patents": [
     {
-      "pdf": "JPA 2026066788-000000.pdf",
+      "pdf": "特開2026-66788.pdf",
       "title": "環境パラメータの測定支援システム",
       "applicant": "PDF本文からLLM確認",
       "category": "単一文献実証",

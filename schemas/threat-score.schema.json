@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PatentViewer 5x5 threat score",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["similarity", "concept_level", "similarity_reason", "concept_level_reason"],
+  "properties": {
+    "similarity": {"type": "integer", "minimum": 1, "maximum": 5},
+    "concept_level": {"type": "integer", "minimum": 1, "maximum": 5},
+    "similarity_reason": {"type": "string", "minLength": 1, "maxLength": 800},
+    "concept_level_reason": {"type": "string", "minLength": 1, "maxLength": 800}
+  }
+}

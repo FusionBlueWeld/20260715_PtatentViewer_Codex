@@ -10,14 +10,17 @@ patent_pool/*
 
 # Previous implementation and superseded reference specifications
 old_source/
-SYSTEM_SPECIFICATION.md
-ui-collaboration-design.md
 
 # Generated research/LLM artifacts
 researches/**/results/
 researches/**/runs/
+researches/**/pipeline/
+researches/**/clustering/
 debug_data/researches/debug_llm_single/**/results/
 debug_data/researches/debug_llm_single/**/runs/
+debug_data/researches/**/pipeline/
+debug_data/researches/**/clustering/
+debug_data/researches/**/runs/
 
 # Editor, OS and temporary files
 .DS_Store

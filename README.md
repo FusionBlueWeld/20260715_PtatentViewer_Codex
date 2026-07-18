@@ -4,7 +4,8 @@
 
 ## 現在できること
 
-- `researches/<research>/subresearches/<subresearch>/patents.json` によるPDF参照
+- `researches/<research>/patent_list_{yyyymmddHHMMSS}.csv` のCP932直接取込（最新1件）
+- CSVがない既存リサーチは `subresearches/<subresearch>/patents.json` を互換入力として使用
 - リサーチ／サブリサーチ／年次／公開・登録／検索のリアルタイム絞り込み
 - 脅威マップと技術マップ、セル連動文献一覧
 - `patent_pool/` のPDFをUI内または別タブでプレビュー
@@ -20,6 +21,8 @@
 - `scripts/start.bat`: サーバーをバックグラウンド起動し、PatentViewerのURLを1つだけ開く
 - `scripts/stop.bat`: トークン認証されたlocalhost終了APIでサーバーを安全に停止する
 
+起動時はPython 3.10以上の候補から、必要なパッケージが導入済みの環境を自動選択します。どの候補にも不足がある場合は、`requirements.txt` のパッケージを初回起動時に導入します。
+
 起動済みの状態で `scripts/start.bat` を再実行すると、サーバーは重複起動せずPatentViewer画面だけを開きます。Edge（なければChrome）のアプリモードを横長サイズで起動するため、余分な「新しいタブ」は作りません。
 
 既定では、人間またはCodexによる実操作が30分間なければ自動停止します。Bridgeのheartbeatやコマンド待受poll、ヘルスチェックだけでは利用時間を延長しません。
@@ -27,7 +30,7 @@
 PowerShellから条件を変更する場合:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -IdleTimeoutMinutes 30
+powershell -ExecutionPolicy Bypass -File .\scripts\start.ps1 -IdleTimeoutMinutes 30
 ```
 
 ブラウザを開かずサーバーだけ起動する場合は `-NoBrowser`、ポート変更は `-Port 8799` を指定します。起動情報は `runtime/server-control.json`、ログは `runtime/server.stdout.log` と `runtime/server.stderr.log` に保存されます。
@@ -43,7 +46,7 @@ python -m pip install -r requirements.txt
 ## DEBUGテスト
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\debug.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\debug.ps1
 ```
 
 このコマンドはunit、API、NORMAL/DEBUG分離、Bridgeプロトコル契約、実データマニフェストを検査します。その後UIをDEBUGへ切り替え、次を実ブラウザで確認します。
@@ -62,7 +65,7 @@ DEBUGの入力は `debug_data/`、書込みは `runtime/debug/` です。NORMAL�
 & "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -X utf8 tools\llm_preflight.py debug_laser_demo --environment debug
 ```
 
-PDF選択、プロンプト、出力分離を検査します。現段階ではOllamaと必要モデルを意図的に `blocked` として報告し、モデル呼出しは行いません。結果形式は `schemas/analysis-result.schema.json`、プロンプトは `src/patent_viewer/prompts/` にあります。
+PDF選択、小型プロンプト5件、小型JSON Schema 5件、出力分離、Ollama接続、必要モデル、請求項構造を検査します。診断中にモデル推論は行いません。不足があれば `blocked`、全条件が揃えば `ready` を返します。LLM別Schemaは `schemas/llm-*.schema.json`、プロンプトは `src/patent_viewer/prompts/stages/` にあります。
 
 まず少数のDEBUG文献で抽出・分析品質を承認した後、通常リサーチへ進める設計です。工程・受入条件は [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) を参照してください。
 
@@ -84,13 +87,33 @@ PDF選択、プロンプト、出力分離を検査します。現段階ではOl
 
 結果を意図的に置換する場合だけ `--overwrite` を付けます。通常運用データへ使う前に、生成要約と請求項本文を人が比較してください。
 
+## 段階分析パイプライン
+
+通常の複数文献分析は、PDF抽出と章・請求項分割をPythonで行った後、ローカルLLMへ「類似度」「権利範囲の広さ」「課題要約」「技術要約」の4つの小さなJSONだけを個別に要求します。各要求には専用の小さなJSON Schemaを適用し、Ollamaの生成制約に加えてPythonでも型、必須キー、追加キー、値域、文字数を再検証します。その後、2要約のEmbedding、リサーチ内クラスタ、短いクラスタ名生成を実行します。
+
+```powershell
+python tools/run_research_pipeline.py laser_process_landscape --stage plan
+python tools/run_research_pipeline.py laser_process_landscape --stage prepare
+python tools/run_research_pipeline.py laser_process_landscape --stage execute
+```
+
+共有抽出キャッシュは `runtime/shared/extractions/` に置きますが、元PDFを常に正とし、リサーチ／文献ごとに再抽出や全文読解を選べます。脅威マップは従来どおり「自社技術との類似度 × 権利範囲の広さ」の5×5です。詳細は [docs/RESEARCH_PIPELINE_DESIGN.md](docs/RESEARCH_PIPELINE_DESIGN.md) を参照してください。
+
+同じ操作は画面上部の `夜間一括分析` から、Codexを介さず実行できます。確認チェック後に主ボタンを押すと、前処理、preflight再確認、LLM分析を連続実行します。文献1件のLLM分析とEmbeddingが完了するたびに30秒のGPU冷却を挟み、件数ベースのプログレスバーと冷却残り時間を表示します。現行方式の分析チェックポイントがある文献の分析LLMは再実行しません。旧方式のチェックポイントは新方式として再利用しません。1文献のJSON生成・Schema検証・Embedding検証に失敗した場合は、その文献を失敗として記録して次文献へ進み、次回実行時に再試行します。要求と応答は文献別の `attempts/<run-id>/llm_calls/`、最新失敗は `analysis_error.json`、run全体の失敗・スキップ一覧は `run_manifest.json` に保存します。pause/resume/cancelが使用でき、実行中はブラウザが閉じてもサーバーのアイドル終了を抑止します。
+
+PDFテキスト抽出と章・請求項構造化だけを先に行う場合は、画面でリサーチを選び、`夜間一括分析` を開いて `前処理だけ実行` を押します。この操作ではOllamaによる意味分析を実行しません。
+
 ## リサーチ追加
 
-1. `researches/<research-id>/research.json` を作る。
-2. `subresearches/<subresearch-id>/patents.json` に `patent_pool/` 内のPDFファイル名を列挙する。
-3. LLM接続後は同じサブリサーチの `results/<PDF stemの空白を_にしたID>.json` へ分析結果を保存する。
+1. `researches/<research-id>/` を作る。表示名や個別パイプライン設定が必要な場合だけ `research.json` を置く。
+2. リサーチ直下に `patent_list_{yyyymmddHHMMSS}.csv` と `company_tech.txt` を置く。CSVが複数ある場合はファイル名の最新タイムスタンプ1件だけを使う。
+3. 分析結果は `subresearches/patent_list/results/<正規化文献ID>.json` へ自動保存される。
 
 PDFそのものをリサーチフォルダへ複製しないことが重要です。
+
+本番リサーチフォルダに格納される `patent_list_{yyyymmddHHMMSS}.csv` の列仕様と現行の取込動作は [docs/PATENT_LIST_CSV_SPEC.md](docs/PATENT_LIST_CSV_SPEC.md) に記録しています。
+
+PDFファイル名は従来の `JPA ...` / `JPB ...` に加え、`WO20xx-XXXXXX`、`特開20xx-XXXXXX`、`特表20xx-XXXXXX`、`特許第XXXXXXX号`、`特開平x-XXXXXX`、`特表平x-XXXXXX` を使用できます。全角数字と一般的なハイフン表記も正規化します。平成表記は年次フィルタ用に西暦へ変換し、登録特許のファイル名だけでは年次を確定できないため、必要な場合は `patents.json` の `year` に明示してください。
 
 ## Git管理するデータの境界
 

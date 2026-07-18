@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local LLM similarity assessment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["similarity", "reason"],
+  "properties": {
+    "similarity": {"type": "integer", "minimum": 1, "maximum": 5},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 800}
+  }
+}

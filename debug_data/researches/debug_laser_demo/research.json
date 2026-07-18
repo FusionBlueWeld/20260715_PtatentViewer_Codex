@@ -1,5 +1,9 @@
 {
   "name": "DEBUG: レーザー加工デモ",
   "description": "UI、マップ、PDF参照、分析解釈を安全に試すための専用fixtureです。通常成果物には書き込みません。",
-  "company_technology": "DEBUG専用の自律型レーザー加工制御技術"
+  "company_technology": "DEBUG専用の自律型レーザー加工制御技術",
+  "pipeline": {
+    "source_policy": {"extraction": "verify_original", "reading": "adaptive"},
+    "threat_scoring": {"map": "5x5", "x_axis": "similarity", "y_axis": "concept_level", "primary_evidence": "independent_claims", "embedding_is_scoring_evidence": false}
+  }
 }

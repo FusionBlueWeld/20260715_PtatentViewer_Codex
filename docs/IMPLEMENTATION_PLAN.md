@@ -4,7 +4,7 @@
 
 ## 1. 到達点
 
-`patent_pool/` を共有・読み取り専用のPDF格納庫とし、`researches/` 配下のリサーチ／サブリサーチごとの `patents.json` から対象文献を参照する。ブラウザUIではリサーチ、サブリサーチ、年次、公開・登録状態を切り替え、脅威マップと技術マップへ即時反映し、セルからPDFをプレビューできるようにする。
+`patent_pool/` を共有・読み取り専用のPDF格納庫とし、`researches/` 配下の各リサーチにある最新の `patent_list_{yyyymmddHHMMSS}.csv` から対象文献を参照する。CSVがない既存データでは `patents.json` を互換入力とする。ブラウザUIではリサーチ、サブリサーチ、年次、公開・登録状態を切り替え、脅威マップと技術マップへ即時反映し、セルからPDFをプレビューできるようにする。
 
 ローカルLLMはこの工程では実行しない。抽出・分析・Embedding・クラスタリングを差し込めるジョブ契約、プロンプト、JSON保存先までを準備し、実行前診断で不足条件を確認できる状態を完成条件とする。
 
@@ -23,7 +23,9 @@
 ```text
 patent_pool/                         # 共有PDF（アプリから書込禁止）
 researches/<research>/
-  research.json                     # 表示名、説明、自社技術
+  patent_list_yyyymmddHHMMSS.csv    # 本番の調査対象（CP932）
+  company_tech.txt                  # リサーチ固有の自社技術（UTF-8）
+  research.json                     # 任意。表示名、説明、パイプライン方針
   subresearches/<subresearch>/
     patents.json                    # 文献ID、分類、任意の手動メタデータ
     results/                        # 通常環境の解析JSON
@@ -90,6 +92,12 @@ DEBUGテストスイートを次の順に定義する。
 ### Phase 5 実証記録（2026-07-16）
 
 人間の明示依頼により、DEBUG専用リサーチの実PDF 1件で接続を実証した。`gemma4:e4b` による7フィールドの分析、`qwen3-embedding:8b` による2本の4096次元Embedding、監査JSON、UI反映まで成功した。NORMAL成果物は変更していない。次の判断点は、複数文献へ拡大する前の請求項照合と要約品質レビューである。
+
+### Phase 6: リサーチ単位・段階パイプライン
+
+単発実証用の一括プロンプトは後方互換のため残し、複数文献の通常処理には `tools/run_research_pipeline.py` を使用する。昨晩の長時間バッチで複雑なチャンク読解JSONと構成要件JSONが出力上限に達したため、この方式は廃止した。通常処理は、共有抽出、規則ベースの章・請求項分割、類似度、概念レベル、課題要約、技術要約、2種Embedding、リサーチ全体クラスタ、短いクラスタ名、UI結果確定に分離する。LLMの各出力は1～2項目の小さなJSON Schemaで生成制約し、Pythonでも再検証する。
+
+コードと契約の実装後、DEBUG実PDF 1件で新方式の `execute` を検証した。4つの生成応答はすべて初回でSchema適合し、`done_reason=stop`、出力246トークン以下で完了した。2要約のEmbedding、クラスタ命名、UI結果確定まで成功し、文献失敗・スキップは0件だった。複数文献の `execute` は長時間実行と人手品質承認を伴うため、まだ通常成果物へ実行していない。詳細設計は [RESEARCH_PIPELINE_DESIGN.md](RESEARCH_PIPELINE_DESIGN.md) を正とする。
 
 ## 5. 受入基準
 

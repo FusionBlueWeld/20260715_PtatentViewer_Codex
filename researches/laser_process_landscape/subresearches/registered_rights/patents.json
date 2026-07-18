@@ -2,11 +2,11 @@
   "name": "登録権利ウォッチ",
   "description": "登録済み文献の権利範囲確認リスト",
   "patents": [
-    {"pdf":"JPB 007843458-000000.pdf","year":2026,"applicant":"未調査","category":"登録権利","tags":["登録"]},
-    {"pdf":"JPB 007839972-000000.pdf","year":2026,"applicant":"未調査","category":"登録権利","tags":["登録"]},
-    {"pdf":"JPB 007814796-000000.pdf","year":2025,"applicant":"未調査","category":"登録権利","tags":["登録"]},
-    {"pdf":"JPB 007792585-000000.pdf","year":2025,"applicant":"未調査","category":"登録権利","tags":["登録"]},
-    {"pdf":"JPB 007702665-000000.pdf","year":2024,"applicant":"未調査","category":"登録権利","tags":["登録"]},
-    {"pdf":"JPB 007659619-000000.pdf","year":2024,"applicant":"未調査","category":"登録権利","tags":["登録"]}
+    {"pdf":"特許第7843458号.pdf","year":2026,"applicant":"未調査","category":"登録権利","tags":["登録"]},
+    {"pdf":"特許第7839972号.pdf","year":2026,"applicant":"未調査","category":"登録権利","tags":["登録"]},
+    {"pdf":"特許第7814796号.pdf","year":2025,"applicant":"未調査","category":"登録権利","tags":["登録"]},
+    {"pdf":"特許第7792585号.pdf","year":2025,"applicant":"未調査","category":"登録権利","tags":["登録"]},
+    {"pdf":"特許第7702665号.pdf","year":2024,"applicant":"未調査","category":"登録権利","tags":["登録"]},
+    {"pdf":"特許第7659619号.pdf","year":2024,"applicant":"未調査","category":"登録権利","tags":["登録"]}
   ]
 }

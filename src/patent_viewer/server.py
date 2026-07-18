@@ -5,6 +5,8 @@ import hmac
 import json
 import mimetypes
 import os
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -14,6 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .domain import DataError, Repository
+from .pipeline import ResearchPipeline, atomic_json
 
 
 PROTOCOL_ACTIONS = ("click", "input", "check", "keydown", "select", "wait", "assert")
@@ -31,9 +34,100 @@ class AppState:
         self.last_user_event_at = 0.0
         self.clients: dict[str, dict] = {}
         self.commands: dict[str, dict] = {}
+        self.pipeline_jobs: dict[str, dict] = {}
         self.activity: list[dict] = []
         self.lock = threading.RLock()
         self.server = None
+
+    def start_pipeline_job(self, environment: str, research_id: str, mode: str, overwrite: bool = False, cooldown_seconds: int = 0) -> dict:
+        if mode not in {"prepare", "execute"}:
+            raise DataError("pipeline modeはprepareまたはexecuteです")
+        ResearchPipeline(self.root, environment, research_id)
+        if not 0 <= cooldown_seconds <= 3600:
+            raise DataError("cooldown_secondsは0〜3600秒で指定してください")
+        with self.lock:
+            for existing in self.pipeline_jobs.values():
+                if existing["environment"] == environment and existing["research_id"] == research_id and self.pipeline_job(existing["id"])["status"] in {"running", "paused", "cancelling"}:
+                    raise DataError("このリサーチのpipeline jobは既に実行中です")
+            job_id = uuid.uuid4().hex
+            job_dir = self.root / "runtime" / environment / "pipeline_jobs" / job_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            control_file = job_dir / "control.json"
+            events_file = job_dir / "progress.json"
+            stdout_path = job_dir / "stdout.json"
+            stderr_path = job_dir / "stderr.log"
+            atomic_json(control_file, {"control": "run"})
+            command = [
+                sys.executable, "-X", "utf8", str(self.root / "tools/run_research_pipeline.py"), research_id,
+                "--environment", environment, "--stage", mode,
+                "--events-file", str(events_file), "--control-file", str(control_file),
+            ]
+            if overwrite:
+                command.append("--overwrite")
+            if mode == "execute" and cooldown_seconds:
+                command.extend(["--cooldown-seconds", str(cooldown_seconds)])
+            stdout_handle = stdout_path.open("wb")
+            stderr_handle = stderr_path.open("wb")
+            process = subprocess.Popen(command, cwd=self.root, stdout=stdout_handle, stderr=stderr_handle, shell=False)
+            job = {
+                "id": job_id, "environment": environment, "research_id": research_id, "mode": mode,
+                "cooldown_seconds": cooldown_seconds,
+                "status": "running", "control": "run", "created_at": time.time(), "process": process,
+                "control_file": control_file, "events_file": events_file, "stdout_path": stdout_path,
+                "stderr_path": stderr_path, "stdout_handle": stdout_handle, "stderr_handle": stderr_handle,
+            }
+            self.pipeline_jobs[job_id] = job
+            self.log("pipeline_job_started", job_id=job_id, research_id=research_id, mode=mode, environment=environment)
+            return self.pipeline_job(job_id)
+
+    def pipeline_job(self, job_id: str) -> dict:
+        job = self.pipeline_jobs.get(job_id)
+        if not job:
+            raise DataError("pipeline jobが見つかりません")
+        process = job["process"]
+        returncode = process.poll()
+        if returncode is not None and job["status"] not in {"completed", "failed", "cancelled"}:
+            job["stdout_handle"].close(); job["stderr_handle"].close()
+            job["status"] = "cancelled" if job["control"] == "cancel" else ("completed" if returncode == 0 else "failed")
+            job["returncode"] = returncode
+            job["completed_at"] = time.time()
+            self.log("pipeline_job_finished", job_id=job_id, status=job["status"], returncode=returncode)
+        progress = {}
+        if job["events_file"].exists():
+            try: progress = json.loads(job["events_file"].read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError): pass
+        error = ""
+        if job["status"] == "failed" and job["stderr_path"].exists():
+            error = job["stderr_path"].read_text(encoding="utf-8", errors="replace")[-2000:]
+            if not error and job["stdout_path"].exists(): error = job["stdout_path"].read_text(encoding="utf-8", errors="replace")[-2000:]
+        return {key: value for key, value in job.items() if key not in {"process", "control_file", "events_file", "stdout_path", "stderr_path", "stdout_handle", "stderr_handle"}} | {"progress": progress, "error": error}
+
+    def control_pipeline_job(self, job_id: str, control: str) -> dict:
+        if control not in {"run", "pause", "cancel"}:
+            raise DataError("pipeline controlが不正です")
+        with self.lock:
+            job = self.pipeline_jobs.get(job_id)
+            if not job:
+                raise DataError("pipeline jobが見つかりません")
+            current = self.pipeline_job(job_id)
+            if current["status"] in {"completed", "failed", "cancelled"}:
+                raise DataError("終了したpipeline jobは制御できません")
+            job["control"] = control
+            atomic_json(job["control_file"], {"control": control})
+            job["status"] = "paused" if control == "pause" else ("cancelling" if control == "cancel" else "running")
+            self.log("pipeline_job_control", job_id=job_id, control=control)
+            return self.pipeline_job(job_id)
+
+    def stop_pipeline_jobs(self) -> None:
+        with self.lock:
+            for job in self.pipeline_jobs.values():
+                if job["process"].poll() is None:
+                    job["control"] = "cancel"
+                    atomic_json(job["control_file"], {"control": "cancel"})
+                    try:
+                        job["process"].terminate()
+                    except OSError:
+                        pass
 
     def log(self, event: str, **detail):
         item = {"at": time.time(), "event": event, **detail}
@@ -54,6 +148,10 @@ class AppState:
             interval = min(5.0, max(0.1, self.idle_timeout / 5))
             while self.server is not None:
                 time.sleep(interval)
+                with self.lock:
+                    pipeline_running = any(job["process"].poll() is None for job in self.pipeline_jobs.values())
+                if pipeline_running:
+                    continue
                 if self.idle_remaining() <= 0:
                     self.log("idle_shutdown", idle_timeout=self.idle_timeout)
                     self.server.shutdown()
@@ -138,11 +236,20 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
             research_id = path.split("/")[3]
             env = query.get("environment", [self.state.environment])[0]
             return self._json(200, self.state.repo.preflight(env, research_id))
+        if path.startswith("/api/researches/") and path.endswith("/pipeline"):
+            research_id = path.split("/")[3]
+            env = query.get("environment", [self.state.environment])[0]
+            overview = ResearchPipeline(self.state.root, env, research_id).overview()
+            active = [self.state.pipeline_job(job_id) for job_id, job in self.state.pipeline_jobs.items() if job["environment"] == env and job["research_id"] == research_id]
+            overview["jobs"] = sorted(active, key=lambda item: item["created_at"], reverse=True)[:10]
+            return self._json(200, overview)
+        if path.startswith("/api/pipeline/jobs/"):
+            return self._json(200, self.state.pipeline_job(path.split("/")[4]))
         if path.startswith("/api/pdfs/"):
             pdf_name = path.removeprefix("/api/pdfs/")
             return self._file(self.state.repo.pdf_path(pdf_name), "application/pdf")
         if path == "/api/ui-protocol":
-            return self._json(200, {"version": 1, "actions": PROTOCOL_ACTIONS, "max_actions": 100, "same_visible_dom": True})
+            return self._json(200, {"version": 2, "actions": PROTOCOL_ACTIONS, "max_actions": 100, "same_visible_dom": True, "capabilities": ["research-pipeline", "pipeline-control"], "pipeline_controls": ["run", "pause", "cancel"]})
         if path == "/api/ui/clients":
             now = time.time()
             with self.state.lock:
@@ -197,6 +304,28 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
             target = self.state.repo.save_interpretation(env, body)
             self.state.log("interpretation_saved", environment=env, patent_id=body.get("patent_id"))
             return self._json(201, {"ok": True, "path": str(target.relative_to(self.state.root))})
+        if path.startswith("/api/researches/") and path.endswith("/pipeline/jobs"):
+            env = body.get("environment", self.state.environment)
+            if env != self.state.environment:
+                return self._json(409, {"error": "画面とサーバーの環境が一致しません"})
+            research_id = path.split("/")[3]
+            mode = body.get("mode")
+            if body.get("source") == "codex" and not self._authorized_codex(env):
+                return self._json(403, {"error": "Codexのpipeline実行は実行中の可視UIコマンドが必要です"})
+            if mode == "execute":
+                if body.get("confirmation") != "RUN_LOCAL_LLM":
+                    raise DataError("ローカルLLM実行の明示確認が必要です")
+                preflight = self.state.repo.preflight(env, research_id)
+                if not preflight["ready"]:
+                    raise DataError("LLM preflightがreadyではありません")
+            try:
+                cooldown_seconds = int(body.get("cooldown_seconds", 0)) if mode == "execute" else 0
+            except (TypeError, ValueError) as exc:
+                raise DataError("cooldown_secondsは整数で指定してください") from exc
+            job = self.state.start_pipeline_job(env, research_id, mode, bool(body.get("overwrite")), cooldown_seconds)
+            return self._json(202, job)
+        if path.startswith("/api/pipeline/jobs/") and path.endswith("/control"):
+            return self._json(200, self.state.control_pipeline_job(path.split("/")[4], str(body.get("control", ""))))
         if path == "/api/ui/clients/heartbeat":
             return self._heartbeat(body)
         if path == "/api/ui/commands":
@@ -385,6 +514,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        server.app_state.stop_pipeline_jobs()  # type: ignore[attr-defined]
         server.server_close()
         try:
             current = json.loads(control_file.read_text(encoding="utf-8"))

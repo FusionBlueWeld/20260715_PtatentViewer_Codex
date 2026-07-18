@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest.mock import patch
 
 from tests.support import build_fixture
 
@@ -52,6 +53,49 @@ class ApiTests(unittest.TestCase):
         self.request("/api/interpretations", payload, headers=headers, expected=201)
         self.request(f"/api/ui/commands/{command['id']}/events", {"clientId":client,"type":"completed"})
         self.assertEqual(self.request(f"/api/ui/commands/{command['id']}")["status"], "completed")
+
+    def test_pipeline_overview_and_execute_confirmation_guard(self):
+        overview = self.request("/api/researches/normal_research/pipeline?environment=normal")
+        self.assertEqual(overview["counts"]["total"], 1)
+        self.assertEqual(overview["counts"]["pending"], 0)
+        self.assertEqual(overview["threat_map"], {})
+        next((self.root / "researches/normal_research/subresearches/sample/results").glob("*.json")).unlink()
+        overview = self.request("/api/researches/normal_research/pipeline?environment=normal")
+        self.assertEqual(overview["counts"]["pending"], 1)
+        self.request("/api/researches/normal_research/pipeline/jobs", {
+            "environment": "normal", "mode": "execute", "source": "human"
+        }, expected=400)
+
+    def test_pipeline_job_start_and_control_contract(self):
+        with patch("patent_viewer.server.subprocess.Popen") as popen:
+            process = popen.return_value
+            process.poll.return_value = None
+            job = self.request("/api/researches/normal_research/pipeline/jobs", {
+                "environment": "normal", "mode": "prepare", "source": "human", "cooldown_seconds": 30
+            }, expected=202)
+            self.assertEqual(job["status"], "running")
+            self.assertEqual(job["cooldown_seconds"], 0)
+            paused = self.request(f"/api/pipeline/jobs/{job['id']}/control", {"control": "pause"})
+            self.assertEqual(paused["status"], "paused")
+            resumed = self.request(f"/api/pipeline/jobs/{job['id']}/control", {"control": "run"})
+            self.assertEqual(resumed["status"], "running")
+            process.poll.return_value = 0
+            self.assertEqual(self.request(f"/api/pipeline/jobs/{job['id']}")["status"], "completed")
+
+    def test_execute_job_passes_cooldown_to_local_pipeline(self):
+        with patch("patent_viewer.server.subprocess.Popen") as popen, patch.object(self.server.app_state.repo, "preflight", return_value={"ready": True}):
+            process = popen.return_value
+            process.poll.return_value = None
+            job = self.request("/api/researches/normal_research/pipeline/jobs", {
+                "environment": "normal", "mode": "execute", "source": "human",
+                "confirmation": "RUN_LOCAL_LLM", "cooldown_seconds": 30,
+            }, expected=202)
+            self.assertEqual(job["cooldown_seconds"], 30)
+            command = popen.call_args.args[0]
+            self.assertIn("--cooldown-seconds", command)
+            self.assertEqual(command[command.index("--cooldown-seconds") + 1], "30")
+            process.poll.return_value = 0
+            self.assertEqual(self.request(f"/api/pipeline/jobs/{job['id']}")["status"], "completed")
 
     def test_debug_switch_and_isolated_human_save(self):
         self.request("/api/environment", {"environment":"debug"})

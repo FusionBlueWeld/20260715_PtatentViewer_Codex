@@ -14,15 +14,15 @@
       <div class="brand-mark">PV</div>
       <div><strong>PatentViewer</strong><span>Research Intelligence Workspace</span></div>
     </div>
-    <nav class="view-tabs" aria-label="表示モード">
-      <button class="tab active" data-view="overview" data-agent-id="view-overview">Overview</button>
-      <button class="tab" data-view="threat" data-agent-id="view-threat">Threat map</button>
-      <button class="tab" data-view="technology" data-agent-id="view-technology">Technology map</button>
-    </nav>
+    <div class="view-tabs" role="group" aria-label="マップ切替">
+      <button class="tab active" data-view="threat" data-agent-id="view-threat" aria-pressed="true">脅威マップ</button>
+      <button class="tab" data-view="technology" data-agent-id="view-technology" aria-pressed="false">技術マップ</button>
+    </div>
     <div class="top-actions">
       <span id="environment-badge" class="environment-badge">NORMAL</span>
       <button class="icon-button" id="debug-toggle" data-agent-id="environment-toggle" aria-label="DEBUG環境へ切替">⌁</button>
       <button class="primary small" id="preflight-button" data-agent-id="llm-preflight">LLM preflight</button>
+      <button class="secondary small" id="pipeline-button" data-agent-id="pipeline-open">夜間一括分析</button>
     </div>
   </header>
 
@@ -73,7 +73,7 @@
         <article class="metric accent"><span>高脅威候補</span><strong id="metric-threat">0</strong><small>類似度4+ / 概念高さ4+</small></article>
       </section>
 
-      <section class="map-grid">
+      <section class="map-grid single-map">
         <article class="panel map-panel" id="threat-panel">
           <header class="panel-head"><div><p class="eyebrow">SIMILARITY × SCOPE</p><h2>脅威マップ</h2></div><span class="legend"><i></i>件数密度</span></header>
           <div class="axis-layout">
@@ -85,13 +85,13 @@
         </article>
 
         <article class="panel map-panel" id="technology-panel">
-          <header class="panel-head"><div><p class="eyebrow">PROBLEM × SOLUTION</p><h2>技術マップ</h2></div><span id="cluster-count" class="status-pill">0 clusters</span></header>
+          <header class="panel-head"><div><p class="eyebrow">PROBLEM × SOLUTION</p><h2>技術マップ</h2></div><div class="technology-map-controls"><label for="technology-cluster-min-size">最小クラスタ件数</label><select id="technology-cluster-min-size" data-agent-id="technology-cluster-min-size"><option value="1">1件以上（すべて）</option><option value="2">2件以上</option><option value="3">3件以上</option><option value="5">5件以上</option><option value="10">10件以上</option></select><span id="cluster-count" class="status-pill">0 clusters</span></div></header>
           <div class="axis-layout tech-axis">
             <span class="y-axis">技術的課題 →</span>
             <div id="technology-map" class="map technology-map" role="grid" aria-label="技術マップ"></div>
             <span class="x-axis">発明技術 →</span>
           </div>
-          <p class="map-note">クラスタ名は分析JSONを読み込み、選択条件に合わせて再集計します。</p>
+          <p id="technology-map-note" class="map-note">クラスタ計算結果は保持し、指定件数未満のクラスタだけを非表示にします。</p>
         </article>
       </section>
 
@@ -129,6 +129,35 @@
     <div class="dialog-head"><div><p class="eyebrow">NO MODEL EXECUTION</p><h2>Local LLM preflight</h2></div><button class="icon-button" data-close-dialog="preflight-dialog" aria-label="閉じる">×</button></div>
     <p>この診断はOllamaやモデルを実行せず、接続直前の条件だけを確認します。</p>
     <div id="preflight-results" class="check-list"></div>
+  </dialog>
+
+  <dialog id="pipeline-dialog" class="compact-dialog pipeline-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">LOCAL LLM · CODEX不要</p><h2>夜間一括分析</h2></div><button class="icon-button" data-close-dialog="pipeline-dialog" aria-label="閉じる">×</button></div>
+    <p class="pipeline-description">CSVリストの未処理PDFをローカルOllamaで順番に分析します。1件完了ごとに30秒冷却し、途中停止後も完了済みLLM成果物を再利用します。</p>
+    <p id="pipeline-policy" class="muted">リサーチ設定を読み込んでいます。</p>
+    <div id="pipeline-counts" class="pipeline-counts"></div>
+    <p class="pipeline-stage-heading">バッチ全体</p>
+    <div id="pipeline-stages" class="pipeline-stages pipeline-overall-stages"></div>
+    <div class="pipeline-actions">
+      <button id="pipeline-refresh" class="secondary small" data-agent-id="pipeline-refresh">状態更新</button>
+      <button id="pipeline-prepare" class="secondary small" data-agent-id="pipeline-prepare">前処理だけ実行</button>
+    </div>
+    <label class="pipeline-confirm"><input id="pipeline-confirm" type="checkbox" data-agent-id="pipeline-execute-confirm"> 未処理PDFをローカルLLMで夜間処理することを確認しました（各件30秒冷却）</label>
+    <button id="pipeline-execute" class="primary full" data-agent-id="pipeline-execute" disabled>夜間一括分析を開始</button>
+    <div id="pipeline-job" class="pipeline-job hidden" aria-live="polite">
+      <div class="section-title"><strong id="pipeline-job-state">待機</strong><span id="pipeline-job-progress"></span></div>
+      <div class="pipeline-progress" role="progressbar" aria-label="文献分析の進捗" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="pipeline-progress-bar"></i></div>
+      <p id="pipeline-progress-label" class="pipeline-progress-label">開始待ち</p>
+      <div id="pipeline-live-counts" class="pipeline-live-counts"></div>
+      <p class="pipeline-stage-heading">現在文献の処理（4回の生成 + Embedding）</p>
+      <div id="pipeline-document-stages" class="pipeline-stages pipeline-document-stages"></div>
+      <div class="button-row">
+        <button id="pipeline-pause" class="secondary small" data-agent-id="pipeline-job-pause">Pause</button>
+        <button id="pipeline-resume" class="secondary small" data-agent-id="pipeline-job-resume">Resume</button>
+        <button id="pipeline-cancel" class="danger small" data-agent-id="pipeline-job-cancel">Cancel</button>
+      </div>
+      <pre id="pipeline-job-detail"></pre>
+    </div>
   </dialog>
 
   <aside id="bridge-panel" class="bridge-panel" aria-label="Codex collaboration status">

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local LLM technology summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tech_summary"],
+  "properties": {
+    "tech_summary": {"type": "string", "minLength": 1, "maxLength": 800}
+  }
+}

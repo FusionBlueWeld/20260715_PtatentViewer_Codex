@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PatentViewer source decision",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["pdf", "shared_cache", "extraction_policy", "reading_policy", "cache_decision", "pdf_sha256", "original_pdf_remains_authoritative"],
+  "properties": {
+    "extraction_policy": {"enum": ["cache", "verify_original", "reextract"]},
+    "reading_policy": {"enum": ["targeted", "hierarchical_full", "adaptive"]},
+    "original_pdf_remains_authoritative": {"const": true}
+  }
+}

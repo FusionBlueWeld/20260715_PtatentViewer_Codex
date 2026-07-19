@@ -32,7 +32,7 @@ PIPELINE_STAGES = (
     "cluster_names",
     "finalize",
 )
-ANALYSIS_PIPELINE_VERSION = "simple-schema-v1"
+ANALYSIS_PIPELINE_VERSION = "adaptive-batch-v2"
 
 
 class DocumentSkipped(RuntimeError):
@@ -367,6 +367,60 @@ def deterministic_clusters(items: dict[str, list[float]], cluster_count: int | N
     return {key: cluster_id for cluster_id, cluster in enumerate(sorted(clusters)) for key in cluster}
 
 
+def scalable_clusters(items: dict[str, list[float]], cluster_count: int | None = None) -> dict[str, int]:
+    """Deterministic bounded-memory spherical mini-batch clustering.
+
+    Exact average linkage is useful for small review sets but its all-pairs
+    distance table cannot represent production collections. Large sets use a
+    structured projection and mini-batch cosine K-means instead.
+    """
+    if len(items) <= 500:
+        return deterministic_clusters(items, cluster_count)
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise DataError("numpy is required for production-scale clustering") from exc
+    keys = sorted(items)
+    matrix = np.asarray([items[key] for key in keys], dtype=np.float32)
+    if matrix.ndim != 2 or not matrix.shape[1]:
+        raise DataError("embedding matrix is invalid")
+    target_dimensions = min(256, matrix.shape[1])
+    padded_dimensions = math.ceil(matrix.shape[1] / target_dimensions) * target_dimensions
+    if padded_dimensions != matrix.shape[1]:
+        matrix = np.pad(matrix, ((0, 0), (0, padded_dimensions - matrix.shape[1])))
+    group_width = padded_dimensions // target_dimensions
+    signs = np.where(np.arange(group_width) % 2, -1.0, 1.0).astype(np.float32)
+    projected = (matrix.reshape(len(keys), target_dimensions, group_width) * signs).sum(axis=2)
+    del matrix
+    norms = np.linalg.norm(projected, axis=1, keepdims=True)
+    projected /= np.maximum(norms, np.float32(1e-12))
+    k = min(len(keys), cluster_count or max(1, round(math.sqrt(len(keys)))))
+    rng = np.random.default_rng(0)
+    initial = np.sort(rng.choice(len(keys), size=k, replace=False))
+    centroids = projected[initial].copy()
+    counts = np.zeros(k, dtype=np.int64)
+    batch_size = min(1024, max(128, len(keys) // max(1, k)))
+    for _ in range(8):
+        for offset in range(0, len(keys), batch_size):
+            batch = projected[offset:offset + batch_size]
+            assigned = np.argmax(batch @ centroids.T, axis=1)
+            for cluster_id in np.unique(assigned):
+                members = batch[assigned == cluster_id]
+                previous = counts[cluster_id]
+                current = len(members)
+                centroids[cluster_id] = (
+                    centroids[cluster_id] * previous + members.sum(axis=0)
+                ) / max(1, previous + current)
+                counts[cluster_id] += current
+            centroid_norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+            centroids /= np.maximum(centroid_norms, np.float32(1e-12))
+    assignments: dict[str, int] = {}
+    for offset in range(0, len(keys), batch_size):
+        assigned = np.argmax(projected[offset:offset + batch_size] @ centroids.T, axis=1)
+        assignments.update({key: int(cluster_id) for key, cluster_id in zip(keys[offset:offset + batch_size], assigned)})
+    return assignments
+
+
 class ResearchPipeline:
     """Filesystem contracts and deterministic stages for one research boundary."""
 
@@ -548,10 +602,10 @@ class ResearchPipeline:
             "schema_version": 1,
             "scope": "research",
             "research_id": self.research_id,
-            "algorithm": "agglomerative-average-linkage-cosine",
+            "algorithm": "adaptive-exact-or-minibatch-cosine",
             "cluster_count_requested": cluster_count,
-            "technology_assignments": deterministic_clusters(technology, cluster_count),
-            "problem_assignments": deterministic_clusters(problem, cluster_count),
+            "technology_assignments": scalable_clusters(technology, cluster_count),
+            "problem_assignments": scalable_clusters(problem, cluster_count),
             "created_at": utc_now(),
         }
         return result
@@ -564,6 +618,145 @@ class ResearchPipeline:
             value[key] = value[key].strip()
         return value
 
+    @staticmethod
+    def analysis_task_file(task: str) -> str:
+        files = {
+            "similarity": "similarity.json",
+            "concept_level": "concept_level.json",
+            "problem_summary": "problem_summary.json",
+            "technology_summary": "technology_summary.json",
+        }
+        if task not in files:
+            raise ValueError(f"unknown document analysis task: {task}")
+        return files[task]
+
+    def analysis_task_current(self, prepared: dict[str, Any], task: str) -> bool:
+        artifact: Path = prepared["artifact_dir"]
+        progress_path = artifact / "analysis_progress.json"
+        if not progress_path.is_file() or not (artifact / self.analysis_task_file(task)).is_file():
+            return False
+        try:
+            progress = read_json(progress_path)
+        except DataError:
+            return False
+        return (
+            progress.get("pipeline_version") == ANALYSIS_PIPELINE_VERSION
+            and task in progress.get("completed_tasks", [])
+        )
+
+    def _analysis_task_data(self, prepared: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        artifact: Path = prepared["artifact_dir"]
+        structure = prepared["structure"]
+        text = (prepared["cache_dir"] / "extracted_text.txt").read_text(encoding="utf-8")
+        sections = structure["sections"]
+        independent = [claim for claim in structure["claims"] if claim["type"] == "independent"] or structure["claims"][:1]
+        claims_text = "\n\n".join(f"【請求項{claim['number']}】{claim['text']}" for claim in independent)
+
+        def bounded(parts: Iterable[tuple[str, str]], maximum: int = 12_000) -> str:
+            output: list[str] = []
+            remaining = maximum
+            for label, value in parts:
+                value = (value or "").strip()
+                if not value or remaining <= 0:
+                    continue
+                block = f"## {label}\n{value}"[:remaining]
+                output.append(block)
+                remaining -= len(block) + 2
+            return "\n\n".join(output) or text[:maximum]
+
+        inputs = {
+            "similarity": bounded((
+                ("独立請求項", claims_text), ("技術分野", sections.get("technical_field", "")),
+                ("課題を解決するための手段", sections.get("solution", "")),
+                ("実施形態", sections.get("embodiments", "")),
+            )),
+            "concept_level": bounded((("独立請求項", claims_text),), maximum=10_000),
+            "problem_summary": bounded((
+                ("背景技術", sections.get("background", "")),
+                ("発明が解決しようとする課題", sections.get("problem", "")),
+                ("発明の効果", sections.get("effects", "")),
+            )),
+            "technology_summary": bounded((
+                ("独立請求項", claims_text), ("技術分野", sections.get("technical_field", "")),
+                ("課題を解決するための手段", sections.get("solution", "")),
+                ("実施形態", sections.get("embodiments", "")),
+            )),
+        }
+        atomic_json(artifact / "analysis_inputs.json", {
+            "pipeline_version": ANALYSIS_PIPELINE_VERSION,
+            "characters": {task: len(value) for task, value in inputs.items()},
+            "sha256": {task: sha256_bytes(value.encode("utf-8")) for task, value in inputs.items()},
+        })
+        return {
+            "similarity": {
+                "company_technology": self.research.get("company_technology", ""),
+                "patent_text": inputs["similarity"],
+            },
+            **{
+                task: {"patent_text": inputs[task]}
+                for task in ("concept_level", "problem_summary", "technology_summary")
+            },
+        }
+
+    def analyze_task(self, prepared: dict[str, Any], task: str, generate_json: "GenerateJson") -> dict[str, Any]:
+        artifact: Path = prepared["artifact_dir"]
+        response = generate_json(task, self._analysis_task_data(prepared)[task])
+        atomic_json(artifact / self.analysis_task_file(task), response)
+        progress_path = artifact / "analysis_progress.json"
+        try:
+            progress = read_json(progress_path) if progress_path.exists() else {}
+        except DataError:
+            progress = {}
+        completed = set(progress.get("completed_tasks", []))
+        completed.add(task)
+        atomic_json(progress_path, {
+            "schema_version": 1,
+            "pipeline_version": ANALYSIS_PIPELINE_VERSION,
+            "completed_tasks": sorted(completed),
+            "updated_at": utc_now(),
+        })
+        return response
+
+    def analysis_task_characters(self, prepared: dict[str, Any], task: str) -> int:
+        return len(self._analysis_task_data(prepared)[task]["patent_text"])
+
+    def assemble_generated_analysis(self, prepared: dict[str, Any]) -> dict[str, Any]:
+        artifact: Path = prepared["artifact_dir"]
+        similarity = read_json(artifact / self.analysis_task_file("similarity"))
+        concept = read_json(artifact / self.analysis_task_file("concept_level"))
+        problem = read_json(artifact / self.analysis_task_file("problem_summary"))
+        technology = read_json(artifact / self.analysis_task_file("technology_summary"))
+        score = validate_score({
+            "similarity": similarity["similarity"],
+            "concept_level": concept["concept_level"],
+            "similarity_reason": similarity["reason"],
+            "concept_level_reason": concept["reason"],
+        })
+        summaries = {
+            "tech_summary": technology["tech_summary"].strip(),
+            "problem_summary": problem["problem_summary"].strip(),
+        }
+        self._require_strings(summaries, ("tech_summary", "problem_summary"))
+        atomic_json(artifact / "threat_score.json", score)
+        atomic_json(artifact / "summaries.json", summaries)
+        return {"artifact_dir": artifact, "score": score, "summaries": summaries}
+
+    def write_embedding(self, prepared: dict[str, Any], vectors: list[list[float]]) -> dict[str, Any]:
+        artifact: Path = prepared["artifact_dir"]
+        generated = self.assemble_generated_analysis(prepared)
+        summaries = generated["summaries"]
+        embedding_inputs = [summaries["tech_summary"], summaries["problem_summary"]]
+        vectors = validate_vectors(vectors, 2)
+        embedding = {
+            "input_order": ["technology", "problem"],
+            "input_sha256": [sha256_bytes(item.encode("utf-8")) for item in embedding_inputs],
+            "dimensions": len(vectors[0]),
+            "vectors": {"technology": vectors[0], "problem": vectors[1]},
+            "created_at": utc_now(),
+        }
+        atomic_json(artifact / "embeddings.json", embedding)
+        return {**generated, "embedding": embedding}
+
     def analyze_document(
         self,
         prepared: dict[str, Any],
@@ -571,6 +764,14 @@ class ResearchPipeline:
         embed_texts: "EmbedTexts",
     ) -> dict[str, Any]:
         """Run four small schema-constrained LLM jobs and two summary embeddings."""
+        for task in ("concept_level", "problem_summary", "similarity", "technology_summary"):
+            self.analyze_task(prepared, task, generate_json)
+        generated = self.assemble_generated_analysis(prepared)
+        inputs = [generated["summaries"]["tech_summary"], generated["summaries"]["problem_summary"]]
+        return self.write_embedding(prepared, embed_texts(inputs))
+
+        # Legacy in-method implementation retained below temporarily for
+        # artifact compatibility documentation; execution returns above.
         artifact: Path = prepared["artifact_dir"]
         structure = prepared["structure"]
         cache_dir: Path = prepared["cache_dir"]
@@ -678,10 +879,14 @@ class ResearchPipeline:
             summary_key = "tech_summary" if kind == "technology" else "problem_summary"
             for cluster_id in sorted(set(assignments.values())):
                 members = [key for key, assigned in assignments.items() if assigned == cluster_id]
+                # Bound the naming prompt for production clusters. Deterministic
+                # sampling keeps reruns reproducible while avoiding 16K overflow.
+                sampled_members = members[:20]
                 response = generate_json("cluster_name", {
                     "kind": kind,
                     "cluster_id": cluster_id,
-                    "summaries": [{"patent_id": key, "summary": analyses[key]["summaries"][summary_key]} for key in members],
+                    "member_count": len(members),
+                    "summaries": [{"patent_id": key, "summary": analyses[key]["summaries"][summary_key]} for key in sampled_members],
                 })
                 self._require_strings(response, ("name",))
                 output[cluster_id] = response["name"]

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -165,7 +167,7 @@ def write_progress_event(path: Path, payload: dict) -> bool:
 
 
 class OllamaStages:
-    def __init__(self, model: str, embedding_model: str, timeout: int, checkpoint=lambda: None, progress=lambda stage, **detail: None):
+    def __init__(self, model: str, embedding_model: str, timeout: int, checkpoint=lambda: None, progress=lambda stage, **detail: None, ollama_url: str = "http://127.0.0.1:11434", keep_alive: str = "1h"):
         self.model = model
         self.embedding_model = embedding_model
         self.timeout = timeout
@@ -173,10 +175,14 @@ class OllamaStages:
         self.counter = 0
         self.checkpoint = checkpoint
         self.progress = progress
+        self.ollama_url = ollama_url.rstrip("/")
+        self.keep_alive = keep_alive
+        self._audit_lock = threading.Lock()
+        self._audit_counters: dict[str, int] = {}
 
     def _post(self, endpoint: str, payload: dict) -> dict:
         request = urllib.request.Request(
-            "http://127.0.0.1:11434" + endpoint,
+            self.ollama_url + endpoint,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json"}, method="POST",
         )
@@ -189,7 +195,7 @@ class OllamaStages:
             raise RuntimeError(f"Ollama {endpoint}: {result['error']}")
         return result
 
-    def generate_json(self, task: str, data: dict) -> dict:
+    def generate_json(self, task: str, data: dict, audit_dir: Path | None = None) -> dict:
         self.checkpoint()
         template = (ROOT / "src/patent_viewer/prompts/stages" / f"{task}.txt").read_text(encoding="utf-8")
         schema = STAGE_SCHEMAS[task]
@@ -211,7 +217,8 @@ class OllamaStages:
             f"{template}\n\n## 出力JSON Schema\n{json.dumps(schema, ensure_ascii=False)}"
             f"\n\n{input_text}"
         )
-        audit = self.audit_dir / "llm_calls" if self.audit_dir else None
+        selected_audit = audit_dir or self.audit_dir
+        audit = selected_audit / "llm_calls" if selected_audit else None
         last_error = "unknown error"
         token_limits = TASK_OUTPUT_TOKENS[task]
         for attempt, num_predict in enumerate(token_limits, 1):
@@ -223,7 +230,7 @@ class OllamaStages:
             prompt = base_prompt + retry_note
             num_ctx = context_window_for(prompt, num_predict)
             payload = {
-                "model": self.model, "prompt": prompt, "stream": False, "format": schema, "keep_alive": "10m",
+                "model": self.model, "prompt": prompt, "stream": False, "format": schema, "keep_alive": self.keep_alive,
                 "options": {"temperature": 0, "top_p": 0.9, "num_ctx": num_ctx, "num_predict": num_predict},
             }
             if task == "cluster_name":
@@ -236,8 +243,12 @@ class OllamaStages:
                     "llm_task", task=task, task_index=DOCUMENT_TASK_INDEX[task], task_total=5,
                     attempt=attempt, max_attempts=len(token_limits),
                 )
-            self.counter += 1
-            call_number = self.counter
+            with self._audit_lock:
+                audit_key = str(audit or "__default__")
+                call_number = self._audit_counters.get(audit_key, 0) + 1
+                self._audit_counters[audit_key] = call_number
+                if audit is None:
+                    self.counter = call_number
             if audit:
                 atomic_json(audit / f"{call_number:03d}-{task}-request.json", {
                     "task": task, "attempt": attempt, "model": self.model,
@@ -270,10 +281,8 @@ class OllamaStages:
     def embed(self, texts: list[str]) -> list[list[float]]:
         self.checkpoint()
         self.progress("llm_task", task="embeddings", task_index=5, task_total=5, attempt=1, max_attempts=1)
-        # Never keep the generation and embedding models resident together on a 16 GiB GPU.
-        self.unload_generation()
         response = self._post("/api/embed", {
-            "model": self.embedding_model, "input": texts, "keep_alive": 0, "options": {"num_ctx": 4096},
+            "model": self.embedding_model, "input": texts, "keep_alive": self.keep_alive, "options": {"num_ctx": 4096},
         })
         vectors = response.get("embeddings")
         if not isinstance(vectors, list):
@@ -287,6 +296,12 @@ class OllamaStages:
             # Cleanup must not replace the actual pipeline result or error.
             pass
 
+    def unload_embedding(self) -> None:
+        try:
+            self._post("/api/generate", {"model": self.embedding_model, "keep_alive": 0})
+        except RuntimeError:
+            pass
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="リサーチ単位の段階パイプラインを準備・実行する")
@@ -295,6 +310,12 @@ def main() -> int:
     parser.add_argument("--stage", choices=("prepare", "plan", "execute"), default="prepare")
     parser.add_argument("--generation-model", default="gemma4:e4b")
     parser.add_argument("--embedding-model", default="qwen3-embedding:8b")
+    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--generation-workers", type=int, default=1)
+    parser.add_argument("--embedding-batch-size", type=int, default=16)
+    parser.add_argument("--shard-size", type=int, default=250)
+    parser.add_argument("--cooldown-every-documents", type=int, default=50)
+    parser.add_argument("--keep-alive", default="1h")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--cluster-count", type=int)
     parser.add_argument("--limit", type=int, help="先頭から処理する文献数（ローカル検証用）")
@@ -305,19 +326,31 @@ def main() -> int:
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
+    if not 1 <= args.generation_workers <= 8:
+        parser.error("--generation-workers must be between 1 and 8")
+    if not 2 <= args.embedding_batch_size <= 1024:
+        parser.error("--embedding-batch-size must be between 2 and 1024")
+    if args.embedding_batch_size % 2:
+        parser.error("--embedding-batch-size must be even")
+    if args.shard_size < 1:
+        parser.error("--shard-size must be at least 1")
+    if args.cooldown_every_documents < 1:
+        parser.error("--cooldown-every-documents must be at least 1")
     if not 0 <= args.cooldown_seconds <= 3600:
         parser.error("--cooldown-seconds must be between 0 and 3600")
 
     last_progress: dict = {}
+    progress_lock = threading.Lock()
 
     def emit(stage: str, **detail):
-        last_progress.clear()
-        last_progress.update({"stage": stage, "detail": detail})
-        if args.events_file:
-            write_progress_event(args.events_file, {
-                "stage": stage, "detail": detail,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
+        with progress_lock:
+            last_progress.clear()
+            last_progress.update({"stage": stage, "detail": detail})
+            if args.events_file:
+                write_progress_event(args.events_file, {
+                    "stage": stage, "detail": detail,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
 
     def checkpoint():
         while args.control_file and args.control_file.exists():
@@ -354,9 +387,13 @@ def main() -> int:
         def model_progress(stage: str, **detail) -> None:
             emit(stage, **progress_context, **detail)
 
-        model = OllamaStages(args.generation_model, args.embedding_model, args.timeout, checkpoint, model_progress)
+        model = OllamaStages(
+            args.generation_model, args.embedding_model, args.timeout, checkpoint, model_progress,
+            ollama_url=args.ollama_url, keep_alive=args.keep_alive,
+        )
         analyses = {}
         locations = {}
+        work_items: list[dict] = []
         extraction_entries: dict[str, list[dict]] = {}
         document_failures: list[dict] = []
         document_skips: list[dict] = []
@@ -491,79 +528,163 @@ def main() -> int:
                     extraction_index_entry(ROOT, subresearch_id, pdf_path.name, prepared)
                 )
                 if args.stage == "execute":
-                    emit("analyzing", patent_id=key, current=progress_index, total=pending_total)
+                    work_items.append({
+                        "key": key, "subresearch_id": subresearch_id, "pdf_path": pdf_path,
+                        "prepared": prepared, "record": document_record, "index": progress_index,
+                        "audit_dir": prepared["artifact_dir"] / "attempts" / run_id,
+                    })
+
+        if args.stage == "execute" and work_items:
+            active = {item["key"]: item for item in work_items}
+            llm_attempted = len(work_items)
+
+            def record_failure(item: dict, exc: Exception, task: str) -> None:
+                failure = {
+                    "schema_version": 1, "pipeline_version": ANALYSIS_PIPELINE_VERSION,
+                    "run_id": run_id, "patent_id": item["key"], "pdf": item["pdf_path"].name,
+                    "error_type": type(exc).__name__, "error": str(exc),
+                    "failed_stage": getattr(exc, "task", task),
+                    "attempts": getattr(exc, "attempts", 1),
+                    "audit_dir": str(item["audit_dir"].relative_to(ROOT)),
+                    "completed_artifacts": sorted(
+                        path.name for path in item["prepared"]["artifact_dir"].glob("*.json")
+                        if path.name not in {"analysis_error.json", "analysis_complete.json"}
+                    ),
+                    "failed_at": datetime.now(timezone.utc).isoformat(), "retry_on_next_run": True,
+                }
+                atomic_json(item["prepared"]["artifact_dir"] / "analysis_error.json", failure)
+                item["record"].update({"analysis_state": "failed", "analysis_error": failure})
+                document_failures.append(failure)
+                active.pop(item["key"], None)
+                emit(
+                    "document_failed", patent_id=item["key"], error=str(exc),
+                    task=task, task_index=DOCUMENT_TASK_INDEX.get(task, 5), task_total=5,
+                    completed=llm_completed + len(document_failures), processed=llm_completed,
+                    succeeded=llm_completed, failed=len(document_failures), skipped=len(document_skips),
+                    current=llm_completed + len(document_failures), total=pending_total,
+                    percent=round((llm_completed + len(document_failures)) / max(1, pending_total) * 100, 1),
+                )
+
+            # Keep each context class resident: short-context jobs first, then long-context jobs.
+            task_order = ("concept_level", "problem_summary", "similarity", "technology_summary")
+            calls_per_cooling_period = max(1, min(args.shard_size, args.cooldown_every_documents * len(task_order)))
+            for task in task_order:
+                pending = [
+                    item for item in active.values()
+                    if args.overwrite or not pipeline.analysis_task_current(item["prepared"], task)
+                ]
+                # Context selection is monotonic with prompt size. Sorting keeps
+                # 4K/8K/16K runners contiguous and prevents repeated reloads.
+                pending.sort(
+                    key=lambda item: pipeline.analysis_task_characters(item["prepared"], task),
+                    reverse=task == "technology_summary",
+                )
+                for offset in range(0, len(pending), calls_per_cooling_period):
+                    checkpoint()
+                    group = pending[offset:offset + calls_per_cooling_period]
                     progress_context.clear()
                     progress_context.update({
-                        "patent_id": key, "current": progress_index, "total": pending_total,
-                        "processed": max(0, progress_index - 1), "succeeded": llm_completed,
+                        "current": min(pending_total, offset), "total": pending_total,
+                        "processed": llm_completed, "succeeded": llm_completed,
                         "failed": len(document_failures), "skipped": len(document_skips),
-                        "percent": round(max(0, progress_index - 1) / max(1, pending_total) * 100, 1),
-                    })
-                    model.audit_dir = prepared["artifact_dir"] / "attempts" / run_id
-                    model.counter = 0
-                    llm_attempted += 1
-                    try:
-                        analyses[key] = pipeline.analyze_document(prepared, model.generate_json, model.embed)
-                    except PipelineCancelled:
-                        raise
-                    except (DocumentAnalysisError, ValueError, RuntimeError, OSError) as exc:
-                        # Malformed or semantically invalid model output is local to this PDF.
-                        # Preserve an audit record, unload the model for cooling, and continue.
-                        model.unload_generation()
-                        failure = {
-                            "schema_version": 1,
-                            "pipeline_version": ANALYSIS_PIPELINE_VERSION,
-                            "run_id": run_id,
-                            "patent_id": key,
-                            "pdf": pdf_path.name,
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
-                            "failed_stage": getattr(exc, "task", "python_validation"),
-                            "attempts": getattr(exc, "attempts", 1),
-                            "audit_dir": str(model.audit_dir.relative_to(ROOT)),
-                            "completed_artifacts": sorted(
-                                path.name for path in prepared["artifact_dir"].glob("*.json")
-                                if path.name not in {"analysis_error.json", "analysis_complete.json"}
-                            ),
-                            "failed_at": datetime.now(timezone.utc).isoformat(),
-                            "retry_on_next_run": True,
-                        }
-                        atomic_json(prepared["artifact_dir"] / "analysis_error.json", failure)
-                        document_record.update({"analysis_state": "failed", "analysis_error": failure})
-                        document_failures.append(failure)
-                        emit(
-                            "document_failed", patent_id=key, error=str(exc), failed=len(document_failures),
-                            task=getattr(exc, "task", "runtime"),
-                            task_index=DOCUMENT_TASK_INDEX.get(getattr(exc, "task", ""), 5), task_total=5,
-                            completed=pending_index, processed=pending_index, succeeded=llm_completed,
-                            skipped=len(document_skips), current=pending_index, total=pending_total,
-                            percent=round(pending_index / max(1, pending_total) * 100, 1),
-                        )
-                        if llm_attempted < llm_total and args.cooldown_seconds:
-                            cooldown(key, pending_index, pending_total)
-                        continue
-                    locations[key] = subresearch_id
-                    llm_completed += 1
-                    error_path = prepared["artifact_dir"] / "analysis_error.json"
-                    if error_path.exists():
-                        error_path.unlink()
-                    document_record["analysis_state"] = "analyzed"
-                    atomic_json(prepared["artifact_dir"] / "analysis_complete.json", {
-                        "schema_version": 1, "patent_id": key, "pdf_sha256": prepared["source_decision"]["pdf_sha256"],
-                        "pipeline_version": ANALYSIS_PIPELINE_VERSION, "run_id": run_id,
-                        "generation_model": args.generation_model, "embedding_model": args.embedding_model,
-                        "audit_dir": str(model.audit_dir.relative_to(ROOT)),
-                        "completed_at": datetime.now(timezone.utc).isoformat(),
                     })
                     emit(
-                        "document_completed", patent_id=key, completed=pending_index,
-                        processed=pending_index, succeeded=llm_completed, failed=len(document_failures),
-                        skipped=len(document_skips), current=pending_index, total=pending_total,
-                        llm_completed=llm_completed, llm_total=llm_total,
-                        percent=round(pending_index / max(1, pending_total) * 100, 1),
+                        "llm_batch", **progress_context, task=task,
+                        task_index=DOCUMENT_TASK_INDEX[task], task_total=5,
+                        batch_size=len(group), workers=args.generation_workers,
                     )
-                    if llm_attempted < llm_total and args.cooldown_seconds:
-                        cooldown(key, pending_index, pending_total)
+
+                    def run_task(item: dict) -> dict:
+                        return pipeline.analyze_task(
+                            item["prepared"], task,
+                            lambda name, data: model.generate_json(name, data, audit_dir=item["audit_dir"]),
+                        )
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=args.generation_workers) as executor:
+                        futures = {executor.submit(run_task, item): item for item in group if item["key"] in active}
+                        for future in concurrent.futures.as_completed(futures):
+                            item = futures[future]
+                            try:
+                                future.result()
+                            except PipelineCancelled:
+                                raise
+                            except (DocumentAnalysisError, ValueError, RuntimeError, OSError) as exc:
+                                record_failure(item, exc, task)
+                    if offset + len(group) < len(pending) and args.cooldown_seconds:
+                        cooldown(f"{task}-batch", min(pending_total, offset + len(group)), pending_total)
+
+            # Generation is finished for every surviving document. Switch models once.
+            model.unload_generation()
+            embedding_items = list(active.values())
+            documents_per_embedding_batch = max(1, args.embedding_batch_size // 2)
+            for offset in range(0, len(embedding_items), documents_per_embedding_batch):
+                checkpoint()
+                group = [item for item in embedding_items[offset:offset + documents_per_embedding_batch] if item["key"] in active]
+                if not group:
+                    continue
+                flat_inputs: list[str] = []
+                for item in group:
+                    generated = pipeline.assemble_generated_analysis(item["prepared"])
+                    flat_inputs.extend([
+                        generated["summaries"]["tech_summary"], generated["summaries"]["problem_summary"],
+                    ])
+                emit(
+                    "llm_batch", task="embeddings", task_index=5, task_total=5,
+                    batch_size=len(group), current=offset, total=pending_total,
+                    processed=llm_completed, succeeded=llm_completed,
+                    failed=len(document_failures), skipped=len(document_skips),
+                )
+                try:
+                    vectors = model.embed(flat_inputs)
+                    if len(vectors) != len(flat_inputs):
+                        raise ValueError(f"expected {len(flat_inputs)} embeddings, got {len(vectors)}")
+                    for index, item in enumerate(group):
+                        analyses[item["key"]] = pipeline.write_embedding(
+                            item["prepared"], vectors[index * 2:index * 2 + 2],
+                        )
+                except PipelineCancelled:
+                    raise
+                except (DocumentAnalysisError, ValueError, RuntimeError, OSError):
+                    # Retry singly so one malformed embedding cannot discard the whole batch.
+                    for item in group:
+                        try:
+                            generated = pipeline.assemble_generated_analysis(item["prepared"])
+                            inputs = [generated["summaries"]["tech_summary"], generated["summaries"]["problem_summary"]]
+                            analyses[item["key"]] = pipeline.write_embedding(item["prepared"], model.embed(inputs))
+                        except (DocumentAnalysisError, ValueError, RuntimeError, OSError) as exc:
+                            record_failure(item, exc, "embeddings")
+
+            model.unload_embedding()
+            for item in work_items:
+                if item["key"] not in analyses:
+                    continue
+                locations[item["key"]] = item["subresearch_id"]
+                llm_completed += 1
+                error_path = item["prepared"]["artifact_dir"] / "analysis_error.json"
+                if error_path.exists():
+                    error_path.unlink()
+                item["record"]["analysis_state"] = "analyzed"
+                atomic_json(item["prepared"]["artifact_dir"] / "analysis_complete.json", {
+                    "schema_version": 1, "patent_id": item["key"],
+                    "pdf_sha256": item["prepared"]["source_decision"]["pdf_sha256"],
+                    "pipeline_version": ANALYSIS_PIPELINE_VERSION, "run_id": run_id,
+                    "generation_model": args.generation_model, "embedding_model": args.embedding_model,
+                    "audit_dir": str(item["audit_dir"].relative_to(ROOT)),
+                    "runtime": {
+                        "generation_workers": args.generation_workers,
+                        "embedding_batch_size": args.embedding_batch_size,
+                        "shard_size": args.shard_size,
+                        "keep_alive": args.keep_alive,
+                    },
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                })
+                emit(
+                    "document_completed", patent_id=item["key"], completed=llm_completed,
+                    processed=llm_completed, succeeded=llm_completed, failed=len(document_failures),
+                    skipped=len(document_skips), current=llm_completed, total=pending_total,
+                    llm_completed=llm_completed, llm_total=llm_total,
+                    percent=round(llm_completed / max(1, pending_total) * 100, 1),
+                )
         extraction_indexes = write_extraction_indexes(ROOT, pipeline, extraction_entries) if extraction_entries else []
         finalized = None
         if args.stage == "execute":
@@ -604,6 +725,15 @@ def main() -> int:
                     "completed_with_document_failures" if args.stage == "execute" and document_failures
                     else ("completed" if args.stage == "execute" else "not_started")
                 ),
+                "runtime": {
+                    "ollama_url": args.ollama_url,
+                    "generation_workers": args.generation_workers,
+                    "embedding_batch_size": args.embedding_batch_size,
+                    "shard_size": args.shard_size,
+                    "cooldown_seconds": args.cooldown_seconds,
+                    "cooldown_every_documents": args.cooldown_every_documents,
+                    "keep_alive": args.keep_alive,
+                },
                 "outputs": finalized,
             },
         )
@@ -614,6 +744,7 @@ def main() -> int:
             skipped=len(document_skips), current=completed_total, total=completed_total, percent=100,
         )
         model.unload_generation()
+        model.unload_embedding()
         print(json.dumps({
             "status": "completed",
             "mode": args.stage,
@@ -630,6 +761,7 @@ def main() -> int:
     except Exception as exc:
         if model is not None:
             model.unload_generation()
+            model.unload_embedding()
         previous = dict(last_progress)
         failure_detail = dict(previous.get("detail", {}))
         failure_detail.update({"error": str(exc), "failed_at_stage": previous.get("stage", "")})

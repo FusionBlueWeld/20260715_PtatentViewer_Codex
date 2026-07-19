@@ -12,7 +12,7 @@
 - 文献ごとの分析要約、評価根拠、解釈メモ保存
 - NORMAL/DEBUGの入力・成果物・監査保存先分離
 - Codexが可視DOMを操作するUI Bridge（発見、意図、進捗、pause/resume/cancel、監査）
-- Ollamaを起動しないLLM preflight
+- モデル推論を実行しないLLM preflight
 
 ## 起動
 
@@ -99,7 +99,11 @@ python tools/run_research_pipeline.py laser_process_landscape --stage execute
 
 共有抽出キャッシュは `runtime/shared/extractions/` に置きますが、元PDFを常に正とし、リサーチ／文献ごとに再抽出や全文読解を選べます。脅威マップは従来どおり「自社技術との類似度 × 権利範囲の広さ」の5×5です。詳細は [docs/RESEARCH_PIPELINE_DESIGN.md](docs/RESEARCH_PIPELINE_DESIGN.md) を参照してください。
 
-同じ操作は画面上部の `夜間一括分析` から、Codexを介さず実行できます。確認チェック後に主ボタンを押すと、前処理、preflight再確認、LLM分析を連続実行します。文献1件のLLM分析とEmbeddingが完了するたびに30秒のGPU冷却を挟み、件数ベースのプログレスバーと冷却残り時間を表示します。現行方式の分析チェックポイントがある文献の分析LLMは再実行しません。旧方式のチェックポイントは新方式として再利用しません。1文献のJSON生成・Schema検証・Embedding検証に失敗した場合は、その文献を失敗として記録して次文献へ進み、次回実行時に再試行します。要求と応答は文献別の `attempts/<run-id>/llm_calls/`、最新失敗は `analysis_error.json`、run全体の失敗・スキップ一覧は `run_manifest.json` に保存します。pause/resume/cancelが使用でき、実行中はブラウザが閉じてもサーバーのアイドル終了を抑止します。
+同じ操作は画面上部の `夜間一括分析` から、Codexを介さず実行できます。アプリは既存の11434番Ollamaに干渉せず、空きローカルポートで専用Ollamaを起動・監視・終了します。GPUの総VRAMと空きVRAMから生成並列数、Embeddingバッチ数、冷却間隔を自動決定し、短文タスク、長文タスク、Embeddingの順にまとめてモデル再ロードを抑えます。冷却待機中もモデルはVRAMに保持し、生成完了後に一度だけEmbeddingモデルへ切り替えます。文献別の `analysis_progress.json` に完了タスクを保存するため、停止後は文献全体ではなく未完了タスクから再開します。1文献のJSON生成・Schema検証・Embedding検証に失敗した場合は、その文献だけを失敗として記録して次文献へ進みます。要求と応答は文献別の `attempts/<run-id>/llm_calls/`、最新失敗は `analysis_error.json`、run全体の設定・失敗・スキップ一覧は `run_manifest.json` に保存します。pause/resume/cancelが使用でき、実行中はブラウザが閉じてもサーバーのアイドル終了を抑止します。
+
+大規模リサーチでは、全ペア距離を保持する階層クラスタリングを使用せず、正規化・固定射影・決定的MiniBatch cosine K-meansへ自動的に切り替えます。クラスタ名生成は各クラスタから最大20件の要約を使い、16Kコンテキストを超えないよう制限します。
+
+通常はVRAM自動設定を使用します。検証時だけ上書きする場合は、アプリサーバーへ `--generation-workers 1`、`--embedding-batch-size 32` のように指定できます。指定しなければGPU名や16/24GBラベルではなく、その起動時点の総VRAMと空きVRAMから決定します。採用値は `/api/health`、pipeline job、`run_manifest.json` に記録されます。
 
 PDFテキスト抽出と章・請求項構造化だけを先に行う場合は、画面でリサーチを選び、`夜間一括分析` を開いて `前処理だけ実行` を押します。この操作ではOllamaによる意味分析を実行しません。
 

@@ -122,7 +122,7 @@ python tools/run_research_pipeline.py laser_process_landscape --stage prepare
 python tools/run_research_pipeline.py laser_process_landscape --stage execute
 ```
 
-UIの夜間一括分析では `--cooldown-seconds 30` を付け、各文献のLLM分析とEmbedding完了後に30秒待機する。`pipeline_version` が現行方式と一致する `analysis_complete.json` がある文献は、停止・障害後の再実行時に工程成果物を再読込し、LLMを再実行せず最終クラスタリングへ進む。旧方式のチェックポイントは再利用しない。文献固有のJSON生成・Schema検証・Embedding検証エラーは `analysis_error.json` に記録し、その文献だけを当該runでスキップして冷却後に次文献へ進む。次回runでは失敗文献を再試行する。キャンセル、Ollama接続障害、全体クラスタリング障害は文献スキップへ変換せず、全体を停止する。実行履歴は最新5件とするが、文献別の実行監査はrun IDごとに保持する。
+UIの一括分析ではアプリ専用Ollamaを空きローカルポートで管理する。GPU名や16/24GBラベルではなく、総VRAM、空きVRAM、予約領域、モデルとKVキャッシュの見積りから生成並列数、Embeddingバッチ数、冷却間隔を決定する。生成は同じコンテキストクラスのタスクをまとめ、生成完了後に一度だけEmbeddingモデルへ切り替える。`--cooldown-seconds` の待機は一定文献相当の生成呼出しごとに行い、`keep_alive`を維持して再ロードを発生させない。文献別 `analysis_progress.json` に完了タスクを保存し、停止・障害後は未完了タスクだけを再実行する。文献固有のJSON生成・Schema検証・Embedding検証エラーは `analysis_error.json` に記録し、その文献だけを当該runでスキップする。キャンセル、Ollama接続障害、全体クラスタリング障害は文献スキップへ変換せず、全体を停止する。実行履歴は最新5件とするが、文献別の実行監査はrun IDごとに保持する。500件を超える集合は全ペア距離を作らず、固定射影とMiniBatch cosine K-meansでクラスタリングする。
 
 既存のUI結果を意図して置換する場合だけ `--overwrite` を付ける。通常リサーチ全件の前にDEBUGの少数文献で、類似度と概念レベルの理由が独立請求項と整合すること、5×5の説明可能性、技術／課題要約の混同がないことを人が承認する。
 

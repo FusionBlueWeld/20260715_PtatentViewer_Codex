@@ -14,6 +14,7 @@ from patent_viewer.pipeline import (
     atomic_json,
     chunk_text,
     deterministic_clusters,
+    scalable_clusters,
     extract_claims,
     extract_claims_with_metadata,
     split_sections,
@@ -23,6 +24,17 @@ from patent_viewer.pipeline import (
 
 
 class ResearchPipelineTests(unittest.TestCase):
+    def test_large_clustering_is_bounded_and_deterministic(self):
+        items = {
+            f"P{index:04d}": [float((index + dimension) % 17) for dimension in range(32)]
+            for index in range(501)
+        }
+        first = scalable_clusters(items, 12)
+        second = scalable_clusters(items, 12)
+        self.assertEqual(first, second)
+        self.assertEqual(set(first), set(items))
+        self.assertLessEqual(len(set(first.values())), 12)
+
     def test_atomic_json_retries_a_transient_windows_file_lock(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "progress.json"
@@ -159,6 +171,8 @@ class ResearchPipelineTests(unittest.TestCase):
 
             pipeline = ResearchPipeline(root, "normal", "sample")
             analysis = pipeline.analyze_document(prepared, generate, lambda texts: [[float(index)] * 128 for index, _ in enumerate(texts, 1)])
+            for task in ("similarity", "concept_level", "problem_summary", "technology_summary"):
+                self.assertTrue(pipeline.analysis_task_current(prepared, task))
             finalized = pipeline.finalize_research({"P1": analysis}, {"P1": "group"}, generate, "run-1")
             result_path = root / finalized["results"]["P1"]
             result = json.loads(result_path.read_text(encoding="utf-8"))

@@ -396,7 +396,7 @@ class Repository:
         target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return target
 
-    def preflight(self, environment: str, research_id: str) -> dict[str, Any]:
+    def preflight(self, environment: str, research_id: str, ollama_url: str = "http://127.0.0.1:11434") -> dict[str, Any]:
         dashboard = self.dashboard(environment, research_id)
         paths = self.paths(environment)
         research_dir = paths.researches / safe_id(research_id, "research id")
@@ -428,7 +428,7 @@ class Repository:
         installed_models: set[str] = set()
         ollama_detail = "Ollamaへ接続できません"
         try:
-            with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=2) as response:
+            with urllib.request.urlopen(ollama_url.rstrip("/") + "/api/tags", timeout=2) as response:
                 tags = json.loads(response.read().decode("utf-8"))
             installed_models = {str(model.get("name", "")) for model in tags.get("models", [])}
             ollama_ok = True

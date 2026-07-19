@@ -127,13 +127,13 @@
 
   <dialog id="preflight-dialog" class="compact-dialog">
     <div class="dialog-head"><div><p class="eyebrow">NO MODEL EXECUTION</p><h2>Local LLM preflight</h2></div><button class="icon-button" data-close-dialog="preflight-dialog" aria-label="閉じる">×</button></div>
-    <p>この診断はOllamaやモデルを実行せず、接続直前の条件だけを確認します。</p>
+    <p>この診断はアプリ専用Ollamaへの接続条件を確認します。モデル推論は実行しません。</p>
     <div id="preflight-results" class="check-list"></div>
   </dialog>
 
   <dialog id="pipeline-dialog" class="compact-dialog pipeline-dialog">
     <div class="dialog-head"><div><p class="eyebrow">LOCAL LLM · CODEX不要</p><h2>夜間一括分析</h2></div><button class="icon-button" data-close-dialog="pipeline-dialog" aria-label="閉じる">×</button></div>
-    <p class="pipeline-description">CSVリストの未処理PDFをローカルOllamaで順番に分析します。1件完了ごとに30秒冷却し、途中停止後も完了済みLLM成果物を再利用します。</p>
+    <p class="pipeline-description">CSVリストの未処理PDFを、VRAMから自動調整した専用Ollamaでタスク別にバッチ分析します。冷却中もモデルを保持し、途中停止後はタスク単位の成果物を再利用します。</p>
     <p id="pipeline-policy" class="muted">リサーチ設定を読み込んでいます。</p>
     <div id="pipeline-counts" class="pipeline-counts"></div>
     <p class="pipeline-stage-heading">バッチ全体</p>
@@ -142,7 +142,7 @@
       <button id="pipeline-refresh" class="secondary small" data-agent-id="pipeline-refresh">状態更新</button>
       <button id="pipeline-prepare" class="secondary small" data-agent-id="pipeline-prepare">前処理だけ実行</button>
     </div>
-    <label class="pipeline-confirm"><input id="pipeline-confirm" type="checkbox" data-agent-id="pipeline-execute-confirm"> 未処理PDFをローカルLLMで夜間処理することを確認しました（各件30秒冷却）</label>
+    <label class="pipeline-confirm"><input id="pipeline-confirm" type="checkbox" data-agent-id="pipeline-execute-confirm"> 未処理PDFをローカルLLMでバッチ処理することを確認しました（一定件数ごとに自動冷却）</label>
     <button id="pipeline-execute" class="primary full" data-agent-id="pipeline-execute" disabled>夜間一括分析を開始</button>
     <div id="pipeline-job" class="pipeline-job hidden" aria-live="polite">
       <div class="section-title"><strong id="pipeline-job-state">待機</strong><span id="pipeline-job-progress"></span></div>

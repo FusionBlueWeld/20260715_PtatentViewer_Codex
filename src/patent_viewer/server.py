@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .domain import DataError, Repository
+from .ollama_runtime import ManagedOllama, adaptive_runtime_config, detect_nvidia_gpu
 from .pipeline import ResearchPipeline, atomic_json
 
 
@@ -24,7 +25,7 @@ TERMINAL = {"completed", "failed", "cancelled"}
 
 
 class AppState:
-    def __init__(self, root: Path, idle_timeout: float = 1800, control_token: str = ""):
+    def __init__(self, root: Path, idle_timeout: float = 1800, control_token: str = "", manage_ollama: bool = False, generation_workers: int | None = None, embedding_batch_size: int | None = None):
         self.root = root.resolve()
         self.repo = Repository(self.root)
         self.environment = "normal"
@@ -38,6 +39,27 @@ class AppState:
         self.activity: list[dict] = []
         self.lock = threading.RLock()
         self.server = None
+        self.runtime_config = adaptive_runtime_config(
+            detect_nvidia_gpu(), generation_workers=generation_workers,
+            embedding_batch_size=embedding_batch_size,
+        )
+        self.ollama = ManagedOllama(self.root / "runtime" / "managed_ollama", self.runtime_config) if manage_ollama else None
+        if self.ollama is not None:
+            self.ollama.start()
+
+    @property
+    def ollama_url(self) -> str:
+        if self.ollama is not None:
+            return self.ollama.url
+        return "http://127.0.0.1:11434"
+
+    def preflight(self, environment: str, research_id: str) -> dict:
+        result = self.repo.preflight(environment, research_id, self.ollama_url)
+        result["ollama_runtime"] = self.ollama.status() if self.ollama else {
+            "managed": False, "running": False, "url": self.ollama_url,
+            "config": self.runtime_config.as_dict(),
+        }
+        return result
 
     def start_pipeline_job(self, environment: str, research_id: str, mode: str, overwrite: bool = False, cooldown_seconds: int = 0) -> dict:
         if mode not in {"prepare", "execute"}:
@@ -47,6 +69,9 @@ class AppState:
             raise DataError("cooldown_secondsは0〜3600秒で指定してください")
         with self.lock:
             for existing in self.pipeline_jobs.values():
+                active = self.pipeline_job(existing["id"])["status"] in {"running", "paused", "cancelling"}
+                if mode == "execute" and existing["mode"] == "execute" and active:
+                    raise DataError("another GPU pipeline job is already running")
                 if existing["environment"] == environment and existing["research_id"] == research_id and self.pipeline_job(existing["id"])["status"] in {"running", "paused", "cancelling"}:
                     raise DataError("このリサーチのpipeline jobは既に実行中です")
             job_id = uuid.uuid4().hex
@@ -61,6 +86,12 @@ class AppState:
                 sys.executable, "-X", "utf8", str(self.root / "tools/run_research_pipeline.py"), research_id,
                 "--environment", environment, "--stage", mode,
                 "--events-file", str(events_file), "--control-file", str(control_file),
+                "--ollama-url", self.ollama_url,
+                "--generation-workers", str(self.runtime_config.generation_workers),
+                "--embedding-batch-size", str(self.runtime_config.embedding_batch_size),
+                "--shard-size", str(self.runtime_config.shard_size),
+                "--cooldown-every-documents", str(self.runtime_config.cooldown_every_documents),
+                "--keep-alive", self.runtime_config.keep_alive,
             ]
             if overwrite:
                 command.append("--overwrite")
@@ -72,6 +103,8 @@ class AppState:
             job = {
                 "id": job_id, "environment": environment, "research_id": research_id, "mode": mode,
                 "cooldown_seconds": cooldown_seconds,
+                "runtime_config": self.runtime_config.as_dict(),
+                "ollama_runtime": self.ollama.status() if self.ollama else {"managed": False},
                 "status": "running", "control": "run", "created_at": time.time(), "process": process,
                 "control_file": control_file, "events_file": events_file, "stdout_path": stdout_path,
                 "stderr_path": stderr_path, "stdout_handle": stdout_handle, "stderr_handle": stderr_handle,
@@ -128,6 +161,11 @@ class AppState:
                         job["process"].terminate()
                     except OSError:
                         pass
+
+    def close(self) -> None:
+        self.stop_pipeline_jobs()
+        if self.ollama is not None:
+            self.ollama.stop()
 
     def log(self, event: str, **detail):
         item = {"at": time.time(), "event": event, **detail}
@@ -220,6 +258,7 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
                 "version": "0.2.0",
                 "idle_timeout_seconds": self.state.idle_timeout,
                 "idle_remaining_seconds": round(self.state.idle_remaining(), 1),
+                "ollama_runtime": self.state.ollama.status() if self.state.ollama else {"managed": False},
             })
         if path not in {"/api/ui/next"}:
             self.state.touch(f"GET {path}")
@@ -235,7 +274,7 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/researches/") and path.endswith("/llm-preflight"):
             research_id = path.split("/")[3]
             env = query.get("environment", [self.state.environment])[0]
-            return self._json(200, self.state.repo.preflight(env, research_id))
+            return self._json(200, self.state.preflight(env, research_id))
         if path.startswith("/api/researches/") and path.endswith("/pipeline"):
             research_id = path.split("/")[3]
             env = query.get("environment", [self.state.environment])[0]
@@ -315,7 +354,7 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
             if mode == "execute":
                 if body.get("confirmation") != "RUN_LOCAL_LLM":
                     raise DataError("ローカルLLM実行の明示確認が必要です")
-                preflight = self.state.repo.preflight(env, research_id)
+                preflight = self.state.preflight(env, research_id)
                 if not preflight["ready"]:
                     raise DataError("LLM preflightがreadyではありません")
             try:
@@ -478,9 +517,13 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
             )
 
 
-def create_server(root: Path, host="127.0.0.1", port=8765, quiet=False, idle_timeout=1800, control_token=""):
+def create_server(root: Path, host="127.0.0.1", port=8765, quiet=False, idle_timeout=1800, control_token="", manage_ollama=False, generation_workers=None, embedding_batch_size=None):
     server = ThreadingHTTPServer((host, port), PatentViewerHandler)
-    server.app_state = AppState(root, idle_timeout=idle_timeout, control_token=control_token)  # type: ignore[attr-defined]
+    server.app_state = AppState(
+        root, idle_timeout=idle_timeout, control_token=control_token,
+        manage_ollama=manage_ollama, generation_workers=generation_workers,
+        embedding_batch_size=embedding_batch_size,
+    )  # type: ignore[attr-defined]
     server.app_state.server = server  # type: ignore[attr-defined]
     server.quiet = quiet  # type: ignore[attr-defined]
     server.app_state.start_idle_monitor()  # type: ignore[attr-defined]
@@ -494,10 +537,22 @@ def main():
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--idle-timeout", type=float, default=1800, help="seconds without user/Codex activity before shutdown")
     parser.add_argument("--control-file", type=Path)
+    parser.add_argument("--generation-workers", type=int, help="override automatic VRAM-derived generation concurrency")
+    parser.add_argument("--embedding-batch-size", type=int, help="override automatic embedding input batch size")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
+    if args.generation_workers is not None and not 1 <= args.generation_workers <= 8:
+        parser.error("--generation-workers must be between 1 and 8")
+    if args.embedding_batch_size is not None and (
+        not 2 <= args.embedding_batch_size <= 1024 or args.embedding_batch_size % 2
+    ):
+        parser.error("--embedding-batch-size must be an even number between 2 and 1024")
     control_token = uuid.uuid4().hex
-    server = create_server(args.root, args.host, args.port, quiet=args.quiet, idle_timeout=args.idle_timeout, control_token=control_token)
+    server = create_server(
+        args.root, args.host, args.port, quiet=args.quiet, idle_timeout=args.idle_timeout,
+        control_token=control_token, manage_ollama=True,
+        generation_workers=args.generation_workers, embedding_batch_size=args.embedding_batch_size,
+    )
     control_file = (args.control_file or (args.root / "runtime/server-control.json")).resolve()
     control_file.parent.mkdir(parents=True, exist_ok=True)
     control_payload = {
@@ -514,7 +569,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        server.app_state.stop_pipeline_jobs()  # type: ignore[attr-defined]
+        server.app_state.close()  # type: ignore[attr-defined]
         server.server_close()
         try:
             current = json.loads(control_file.read_text(encoding="utf-8"))

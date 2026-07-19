@@ -66,7 +66,7 @@ if ($python) { $candidates += $python.Source }
 $candidates = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
 
 function Test-Python([string]$Candidate, [switch]$RequirePackages) {
-    $probe = if ($RequirePackages) { 'import sys; import pypdf; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' } else { 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' }
+    $probe = if ($RequirePackages) { 'import sys; import pypdf; import numpy; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' } else { 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' }
     try {
         & $Candidate -X utf8 -c $probe *> $null
         return $LASTEXITCODE -eq 0
@@ -96,7 +96,7 @@ $arguments = @('-X','utf8','run.py','--port',"$Port",'--root',$projectRoot,'--id
 $process = Start-Process -FilePath $pythonPath -ArgumentList $arguments -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
 
 $started = $false
-for ($i = 0; $i -lt 60; $i++) {
+for ($i = 0; $i -lt 180; $i++) {
     if ($process.HasExited) { break }
     try {
         $health = Invoke-RestMethod -Uri ($url + 'api/health') -TimeoutSec 1

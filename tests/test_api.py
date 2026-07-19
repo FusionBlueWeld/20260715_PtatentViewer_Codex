@@ -94,6 +94,12 @@ class ApiTests(unittest.TestCase):
             command = popen.call_args.args[0]
             self.assertIn("--cooldown-seconds", command)
             self.assertEqual(command[command.index("--cooldown-seconds") + 1], "30")
+            self.assertIn("--ollama-url", command)
+            self.assertIn("--generation-workers", command)
+            self.assertIn("--embedding-batch-size", command)
+            self.assertIn("--shard-size", command)
+            self.assertIn("--cooldown-every-documents", command)
+            self.assertIn("runtime_config", job)
             process.poll.return_value = 0
             self.assertEqual(self.request(f"/api/pipeline/jobs/{job['id']}")["status"], "completed")
 

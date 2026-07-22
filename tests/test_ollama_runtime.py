@@ -11,22 +11,30 @@ from patent_viewer.ollama_runtime import (
     ManagedOllama,
     adaptive_runtime_config,
     detect_nvidia_gpu,
+    detect_system_memory_mib,
 )
 
 
 class OllamaRuntimeTests(unittest.TestCase):
     def test_runtime_capacity_is_derived_from_available_vram(self):
-        constrained = adaptive_runtime_config(GpuInfo("test", "gpu-a", 16376, 15300))
-        roomy = adaptive_runtime_config(GpuInfo("production", "gpu-b", 24564, 23500))
+        constrained = adaptive_runtime_config(GpuInfo("test", "gpu-a", 16376, 15300), system_memory_mib=16 * 1024)
+        roomy = adaptive_runtime_config(GpuInfo("production", "gpu-b", 24564, 23500), system_memory_mib=128 * 1024)
         self.assertEqual(constrained.generation_workers, 1)
         self.assertEqual(roomy.generation_workers, 2)
         self.assertGreater(roomy.embedding_batch_size, constrained.embedding_batch_size)
         self.assertGreater(roomy.shard_size, constrained.shard_size)
         self.assertEqual(roomy.mode, "auto")
+        self.assertFalse(constrained.durable_shards)
+        self.assertTrue(roomy.durable_shards)
+        self.assertEqual(roomy.system_memory_mib, 128 * 1024)
+
+    def test_system_memory_detection_returns_a_nonnegative_value(self):
+        self.assertGreaterEqual(detect_system_memory_mib(), 0)
 
     def test_manual_values_override_capacity_estimate(self):
         config = adaptive_runtime_config(
             GpuInfo("gpu", "gpu-c", 16376, 15000), generation_workers=2, embedding_batch_size=48,
+            system_memory_mib=16 * 1024,
         )
         self.assertEqual(config.generation_workers, 2)
         self.assertEqual(config.embedding_batch_size, 48)

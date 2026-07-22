@@ -2,6 +2,7 @@ import json
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -57,6 +58,7 @@ class ApiTests(unittest.TestCase):
     def test_pipeline_overview_and_execute_confirmation_guard(self):
         overview = self.request("/api/researches/normal_research/pipeline?environment=normal")
         self.assertEqual(overview["counts"]["total"], 1)
+        self.assertEqual(overview["counts"]["available"], 1)
         self.assertEqual(overview["counts"]["pending"], 0)
         self.assertEqual(overview["threat_map"], {})
         next((self.root / "researches/normal_research/subresearches/sample/results").glob("*.json")).unlink()
@@ -83,25 +85,48 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(self.request(f"/api/pipeline/jobs/{job['id']}")["status"], "completed")
 
     def test_execute_job_passes_cooldown_to_local_pipeline(self):
-        with patch("patent_viewer.server.subprocess.Popen") as popen, patch.object(self.server.app_state.repo, "preflight", return_value={"ready": True}):
-            process = popen.return_value
-            process.poll.return_value = None
-            job = self.request("/api/researches/normal_research/pipeline/jobs", {
+        original_config = self.server.app_state.runtime_config
+        self.server.app_state.runtime_config = replace(original_config, durable_shards=True)
+        try:
+            with patch("patent_viewer.server.subprocess.Popen") as popen, patch.object(self.server.app_state.repo, "preflight", return_value={"ready": True}):
+                process = popen.return_value
+                process.poll.return_value = None
+                job = self.request("/api/researches/normal_research/pipeline/jobs", {
+                    "environment": "normal", "mode": "execute", "source": "human",
+                    "confirmation": "RUN_LOCAL_LLM", "cooldown_seconds": 30, "overwrite": True,
+                }, expected=202)
+                self.assertEqual(job["cooldown_seconds"], 30)
+                self.assertTrue(job["overwrite"])
+                command = popen.call_args.args[0]
+                self.assertIn("--overwrite", command)
+                self.assertIn("--cooldown-seconds", command)
+                self.assertEqual(command[command.index("--cooldown-seconds") + 1], "30")
+                self.assertIn("--ollama-url", command)
+                self.assertIn("--generation-workers", command)
+                self.assertIn("--embedding-batch-size", command)
+                self.assertIn("--shard-size", command)
+                self.assertIn("--cooldown-every-documents", command)
+                self.assertIn("--durable-shards", command)
+                self.assertTrue(job["runtime_config"]["durable_shards"])
+                process.poll.return_value = 0
+                self.assertEqual(self.request(f"/api/pipeline/jobs/{job['id']}")["status"], "completed")
+        finally:
+            self.server.app_state.runtime_config = original_config
+
+    def test_execute_job_rejects_cooldown_above_ui_limit(self):
+        with patch.object(self.server.app_state.repo, "preflight", return_value={"ready": True}):
+            self.request("/api/researches/normal_research/pipeline/jobs", {
                 "environment": "normal", "mode": "execute", "source": "human",
-                "confirmation": "RUN_LOCAL_LLM", "cooldown_seconds": 30,
-            }, expected=202)
-            self.assertEqual(job["cooldown_seconds"], 30)
-            command = popen.call_args.args[0]
-            self.assertIn("--cooldown-seconds", command)
-            self.assertEqual(command[command.index("--cooldown-seconds") + 1], "30")
-            self.assertIn("--ollama-url", command)
-            self.assertIn("--generation-workers", command)
-            self.assertIn("--embedding-batch-size", command)
-            self.assertIn("--shard-size", command)
-            self.assertIn("--cooldown-every-documents", command)
-            self.assertIn("runtime_config", job)
-            process.poll.return_value = 0
-            self.assertEqual(self.request(f"/api/pipeline/jobs/{job['id']}")["status"], "completed")
+                "confirmation": "RUN_LOCAL_LLM", "cooldown_seconds": 181,
+            }, expected=400)
+
+    def test_ui_exposes_full_reanalysis_control(self):
+        project = Path(__file__).parents[1]
+        html = (project / "public/index.html").read_text(encoding="utf-8")
+        script = (project / "public/assets/app.js").read_text(encoding="utf-8")
+        self.assertIn('id="pipeline-overwrite"', html)
+        self.assertIn("全件を再分析", html)
+        self.assertIn("const overwrite=mode==='execute'&&$('#pipeline-overwrite').checked", script)
 
     def test_debug_switch_and_isolated_human_save(self):
         self.request("/api/environment", {"environment":"debug"})

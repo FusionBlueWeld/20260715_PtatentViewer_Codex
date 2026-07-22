@@ -23,16 +23,19 @@ READING_MODES = {"cache", "verify_original", "reextract"}
 PIPELINE_STAGES = (
     "extract",
     "structure",
+    "company_profile",
     "similarity",
     "concept_level",
     "problem_summary",
     "technology_summary",
     "embeddings",
+    "company_embedding",
     "clustering",
     "cluster_names",
+    "semantic_ordering",
     "finalize",
 )
-ANALYSIS_PIPELINE_VERSION = "adaptive-batch-v2"
+ANALYSIS_PIPELINE_VERSION = "semantic-map-v3"
 
 
 class DocumentSkipped(RuntimeError):
@@ -421,6 +424,93 @@ def scalable_clusters(items: dict[str, list[float]], cluster_count: int | None =
     return assignments
 
 
+def normalized_mean(vectors: Iterable[list[float]]) -> list[float]:
+    """Return the unit-normalized mean used as a cosine cluster centroid."""
+    rows = list(vectors)
+    if not rows:
+        raise ValueError("cannot calculate an empty centroid")
+    dimensions = {len(row) for row in rows}
+    if len(dimensions) != 1 or not next(iter(dimensions)):
+        raise ValueError("centroid vectors have inconsistent dimensions")
+    normalized: list[list[float]] = []
+    for row in rows:
+        norm = math.sqrt(sum(value * value for value in row))
+        normalized.append([value / norm for value in row] if norm else [0.0] * len(row))
+    mean = [sum(row[index] for row in normalized) / len(normalized) for index in range(len(normalized[0]))]
+    norm = math.sqrt(sum(value * value for value in mean))
+    return [value / norm for value in mean] if norm else mean
+
+
+def cluster_centroids(items: dict[str, list[float]], assignments: dict[str, int]) -> dict[int, list[float]]:
+    grouped: dict[int, list[list[float]]] = {}
+    for key, cluster_id in assignments.items():
+        grouped.setdefault(cluster_id, []).append(items[key])
+    return {cluster_id: normalized_mean(vectors) for cluster_id, vectors in grouped.items()}
+
+
+def semantic_cluster_order(centroids: dict[int, list[float]]) -> list[int]:
+    """Linearize an average-linkage cosine hierarchy while preserving close neighbours.
+
+    Embedding space has no intrinsic left or right edge.  This deterministic leaf
+    seriation chooses the orientation of every hierarchy branch that minimizes
+    adjacent cosine distance; callers may reverse the final list for presentation.
+    """
+    keys = sorted(centroids)
+    if len(keys) < 2:
+        return keys
+    pair_distance = {
+        tuple(sorted((left, right))): cosine_distance(centroids[left], centroids[right])
+        for index, left in enumerate(keys) for right in keys[index + 1:]
+    }
+
+    def distance(left: int, right: int) -> float:
+        return 0.0 if left == right else pair_distance[tuple(sorted((left, right)))]
+
+    nodes: list[tuple[tuple[int, ...], tuple | None]] = [((key,), None) for key in keys]
+    while len(nodes) > 1:
+        candidates = []
+        for left_index, (left_leaves, _) in enumerate(nodes):
+            for right_index in range(left_index + 1, len(nodes)):
+                right_leaves = nodes[right_index][0]
+                average = sum(distance(a, b) for a in left_leaves for b in right_leaves) / (len(left_leaves) * len(right_leaves))
+                candidates.append((average, tuple(sorted(left_leaves + right_leaves)), left_index, right_index))
+        _, merged_leaves, left_index, right_index = min(candidates)
+        left_node, right_node = nodes[left_index], nodes[right_index]
+        merged = (merged_leaves, (left_node, right_node))
+        nodes = [node for index, node in enumerate(nodes) if index not in {left_index, right_index}]
+        nodes.append(merged)
+        nodes.sort(key=lambda node: node[0])
+
+    def ordered(node: tuple[tuple[int, ...], tuple | None]) -> tuple[int, ...]:
+        leaves, children = node
+        if children is None:
+            return leaves
+        left = ordered(children[0])
+        right = ordered(children[1])
+        variants = {
+            left + right, left[::-1] + right, left + right[::-1], left[::-1] + right[::-1],
+            right + left, right[::-1] + left, right + left[::-1], right[::-1] + left[::-1],
+        }
+        return min(variants, key=lambda order: (sum(distance(a, b) for a, b in zip(order, order[1:])), order))
+
+    return list(ordered(nodes[0]))
+
+
+def relative_proximity(reference: list[float], centroids: dict[int, list[float]]) -> dict[int, dict[str, float]]:
+    similarities = {cluster_id: 1.0 - cosine_distance(reference, centroid) for cluster_id, centroid in centroids.items()}
+    if not similarities:
+        return {}
+    low, high = min(similarities.values()), max(similarities.values())
+    spread = high - low
+    return {
+        cluster_id: {
+            "cosine_similarity": round(similarity, 6),
+            "relative_strength": round((similarity - low) / spread, 6) if spread > 1e-12 else 1.0,
+        }
+        for cluster_id, similarity in similarities.items()
+    }
+
+
 class ResearchPipeline:
     """Filesystem contracts and deterministic stages for one research boundary."""
 
@@ -477,6 +567,19 @@ class ResearchPipeline:
             raise DataError(f"処理済み結果の段階成果物が不足しています: {patent_key(pdf_name)} ({', '.join(missing)})")
         return {"artifact_dir": artifact, **{key: read_json(artifact / filename) for key, filename in required.items()}}
 
+    def load_prepared_document(self, subresearch_id: str, pdf_name: str) -> dict[str, Any]:
+        """Reload preparation artifacts so production shards need not retain document text in RAM."""
+        artifact = self.artifact_dir(subresearch_id, pdf_name)
+        source_decision = read_json(artifact / "source_decision.json")
+        structure = read_json(artifact / "document_structure.json")
+        cache_dir = (self.root / source_decision["shared_cache"]).resolve()
+        if not (cache_dir / "extracted_text.txt").is_file():
+            raise DataError(f"prepared extraction cache is missing: {patent_key(pdf_name)}")
+        return {
+            "artifact_dir": artifact, "cache_dir": cache_dir,
+            "source_decision": source_decision, "structure": structure,
+        }
+
     def analysis_checkpoint_current(self, subresearch_id: str, pdf_name: str) -> bool:
         checkpoint = self.artifact_dir(subresearch_id, pdf_name) / "analysis_complete.json"
         if not checkpoint.is_file():
@@ -522,6 +625,7 @@ class ResearchPipeline:
             "documents": items,
             "counts": {
                 "total": len(items),
+                "available": sum(item["pdf_available"] for item in items),
                 "prepared": sum(item["stages"]["structure"] for item in items),
                 "analyzed": sum(item["stages"]["threat_score"] and item["stages"]["summaries"] for item in items),
                 "finalized": sum(item["finalized"] for item in items),
@@ -757,6 +861,21 @@ class ResearchPipeline:
         atomic_json(artifact / "embeddings.json", embedding)
         return {**generated, "embedding": embedding}
 
+    @classmethod
+    def build_company_reference(cls, profile: dict[str, Any], vectors: list[list[float]]) -> dict[str, Any]:
+        cls._require_strings(profile, ("technology_summary", "problem_summary"))
+        inputs = [profile["technology_summary"], profile["problem_summary"]]
+        vectors = validate_vectors(vectors, 2)
+        return {
+            "schema_version": 1,
+            "input_order": ["technology", "problem"],
+            "summaries": {"technology": inputs[0], "problem": inputs[1]},
+            "input_sha256": [sha256_bytes(item.encode("utf-8")) for item in inputs],
+            "dimensions": len(vectors[0]),
+            "vectors": {"technology": vectors[0], "problem": vectors[1]},
+            "created_at": utc_now(),
+        }
+
     def analyze_document(
         self,
         prepared: dict[str, Any],
@@ -870,6 +989,8 @@ class ResearchPipeline:
         generate_json: "GenerateJson",
         run_id: str,
         cluster_count: int | None = None,
+        company_reference: dict[str, Any] | None = None,
+        progress: Callable[..., None] | None = None,
     ) -> dict[str, Any]:
         vectors = {key: value["embedding"]["vectors"] for key, value in analyses.items()}
         clustering = self.cluster(vectors, cluster_count)
@@ -896,8 +1017,40 @@ class ResearchPipeline:
         problem_names = names("problem", clustering["problem_assignments"])
         clustering["technology_cluster_names"] = tech_names
         clustering["problem_cluster_names"] = problem_names
+        if progress:
+            progress("semantic_ordering", documents=len(analyses))
+        technology_vectors = {key: value["technology"] for key, value in vectors.items()}
+        problem_vectors = {key: value["problem"] for key, value in vectors.items()}
+        technology_centroids = cluster_centroids(technology_vectors, clustering["technology_assignments"])
+        problem_centroids = cluster_centroids(problem_vectors, clustering["problem_assignments"])
+        technology_order = semantic_cluster_order(technology_centroids)
+        problem_order = semantic_cluster_order(problem_centroids)
+        if company_reference:
+            technology_proximity = relative_proximity(company_reference["vectors"]["technology"], technology_centroids)
+            problem_proximity = relative_proximity(company_reference["vectors"]["problem"], problem_centroids)
+            # Reversal does not change semantic adjacency. Use it only to put the
+            # more company-relevant endpoint on the conventional top/left side.
+            if len(technology_order) > 1 and technology_proximity[technology_order[-1]]["cosine_similarity"] > technology_proximity[technology_order[0]]["cosine_similarity"]:
+                technology_order.reverse()
+            if len(problem_order) > 1 and problem_proximity[problem_order[-1]]["cosine_similarity"] > problem_proximity[problem_order[0]]["cosine_similarity"]:
+                problem_order.reverse()
+        else:
+            technology_proximity = {}
+            problem_proximity = {}
+        clustering["semantic_ordering"] = {
+            "algorithm": "average-linkage-cosine-leaf-seriation",
+            "technology_order": technology_order,
+            "problem_order": problem_order,
+        }
+        clustering["company_proximity"] = {
+            "scale": "research-relative-minmax",
+            "technology": technology_proximity,
+            "problem": problem_proximity,
+        }
         cluster_dir = self.research_dir / "clustering" / run_id
         atomic_json(cluster_dir / "clusters.json", clustering)
+        if company_reference:
+            atomic_json(cluster_dir / "company_reference.json", company_reference)
 
         results: dict[str, str] = {}
         for key, analysis in analyses.items():
@@ -911,11 +1064,17 @@ class ResearchPipeline:
                 "reasoning": f"類似度: {score['similarity_reason']}\n概念レベル: {score['concept_level_reason']}",
                 "tech_cluster": tech_names[clustering["technology_assignments"][key]],
                 "problem_cluster": problem_names[clustering["problem_assignments"][key]],
+                "tech_cluster_id": clustering["technology_assignments"][key],
+                "problem_cluster_id": clustering["problem_assignments"][key],
             }
             result_path = self.research_dir / "subresearches" / locations[key] / "results" / f"{key}.json"
             atomic_json(result_path, result)
             results[key] = str(result_path.relative_to(self.root))
-        return {"clustering": str((cluster_dir / "clusters.json").relative_to(self.root)), "results": results}
+        return {
+            "clustering": str((cluster_dir / "clusters.json").relative_to(self.root)),
+            "company_reference": str((cluster_dir / "company_reference.json").relative_to(self.root)) if company_reference else None,
+            "results": results,
+        }
 
 
 GenerateJson = Callable[[str, dict[str, Any]], dict[str, Any]]

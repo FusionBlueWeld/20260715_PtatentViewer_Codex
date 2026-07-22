@@ -42,6 +42,7 @@ class PipelineCancelled(RuntimeError):
 
 
 SCHEMA_FILES = {
+    "company_profile": "llm-company-profile.schema.json",
     "similarity": "llm-similarity.schema.json",
     "concept_level": "llm-concept-level.schema.json",
     "problem_summary": "llm-problem-summary.schema.json",
@@ -53,6 +54,7 @@ STAGE_SCHEMAS = {
     for task, filename in SCHEMA_FILES.items()
 }
 TASK_OUTPUT_TOKENS = {
+    "company_profile": (384, 512, 768),
     "similarity": (384, 512, 768),
     "concept_level": (384, 512, 768),
     "problem_summary": (384, 512, 768),
@@ -199,7 +201,9 @@ class OllamaStages:
         self.checkpoint()
         template = (ROOT / "src/patent_viewer/prompts/stages" / f"{task}.txt").read_text(encoding="utf-8")
         schema = STAGE_SCHEMAS[task]
-        if task == "similarity":
+        if task == "company_profile":
+            input_text = f"## 自社技術定義\n{data['company_technology']}"
+        elif task == "similarity":
             input_text = (
                 f"## 自社技術\n{data['company_technology']}\n\n"
                 f"## 市場特許\n{data['patent_text']}"
@@ -236,6 +240,11 @@ class OllamaStages:
             if task == "cluster_name":
                 self.progress(
                     "cluster_naming", task=task, attempt=attempt,
+                    max_attempts=len(token_limits),
+                )
+            elif task == "company_profile":
+                self.progress(
+                    "company_profile", task=task, attempt=attempt,
                     max_attempts=len(token_limits),
                 )
             else:
@@ -314,6 +323,7 @@ def main() -> int:
     parser.add_argument("--generation-workers", type=int, default=1)
     parser.add_argument("--embedding-batch-size", type=int, default=16)
     parser.add_argument("--shard-size", type=int, default=250)
+    parser.add_argument("--durable-shards", action="store_true", help="persist and release each shard before global clustering")
     parser.add_argument("--cooldown-every-documents", type=int, default=50)
     parser.add_argument("--keep-alive", default="1h")
     parser.add_argument("--timeout", type=int, default=900)
@@ -336,19 +346,58 @@ def main() -> int:
         parser.error("--shard-size must be at least 1")
     if args.cooldown_every_documents < 1:
         parser.error("--cooldown-every-documents must be at least 1")
-    if not 0 <= args.cooldown_seconds <= 3600:
-        parser.error("--cooldown-seconds must be between 0 and 3600")
+    if not 0 <= args.cooldown_seconds <= 180:
+        parser.error("--cooldown-seconds must be between 0 and 180")
 
     last_progress: dict = {}
     progress_lock = threading.Lock()
+    timing = {"started": time.monotonic(), "phase": None, "phase_started": time.monotonic(), "durations": {}}
+
+    def timing_phase(stage: str, detail: dict) -> str:
+        if stage == "cooldown":
+            return "cooldown"
+        if stage in {"initializing", "preparing", "skipped", "already_processed", "checkpoint_reused"}:
+            return "preparation"
+        if stage == "company_profile":
+            return "company_profile"
+        if stage in {"llm_batch", "llm_task"}:
+            task = detail.get("task", "generation")
+            return "embeddings" if task == "embeddings" else f"generation:{task}"
+        if stage == "company_embedding":
+            return "company_embedding"
+        if stage in {"clustering", "cluster_naming"}:
+            return "clustering_and_naming"
+        if stage == "semantic_ordering":
+            return "semantic_ordering"
+        if stage in {"completed", "failed", "nothing_to_process"}:
+            return "finalization"
+        return stage
 
     def emit(stage: str, **detail):
         with progress_lock:
+            now = time.monotonic()
+            phase = timing_phase(stage, detail)
+            if timing["phase"] is None:
+                timing["phase"] = phase
+                timing["phase_started"] = now
+            elif phase != timing["phase"]:
+                previous = timing["phase"]
+                timing["durations"][previous] = timing["durations"].get(previous, 0.0) + now - timing["phase_started"]
+                timing["phase"] = phase
+                timing["phase_started"] = now
+            durations = dict(timing["durations"])
+            durations[phase] = durations.get(phase, 0.0) + now - timing["phase_started"]
+            timing_snapshot = {
+                "elapsed_seconds": round(now - timing["started"], 1),
+                "current_phase": phase,
+                "current_phase_elapsed_seconds": round(now - timing["phase_started"], 1),
+                "phase_durations_seconds": {key: round(value, 1) for key, value in durations.items()},
+            }
             last_progress.clear()
-            last_progress.update({"stage": stage, "detail": detail})
+            last_progress.update({"stage": stage, "detail": detail, "timing": timing_snapshot})
             if args.events_file:
                 write_progress_event(args.events_file, {
-                    "stage": stage, "detail": detail,
+                    "stage": stage, "detail": detail, "timing": timing_snapshot,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 })
 
@@ -393,6 +442,8 @@ def main() -> int:
         )
         analyses = {}
         locations = {}
+        company_profile = None
+        company_reference = None
         work_items: list[dict] = []
         extraction_entries: dict[str, list[dict]] = {}
         document_failures: list[dict] = []
@@ -432,7 +483,8 @@ def main() -> int:
                 final_path = pipeline.result_path(subresearch_id, pdf_path.name)
                 if args.stage == "execute" and final_path.exists() and not args.overwrite:
                     if pending_total:
-                        existing_analyses[key] = pipeline.load_analysis_artifacts(subresearch_id, pdf_path.name)
+                        if not args.durable_shards:
+                            existing_analyses[key] = pipeline.load_analysis_artifacts(subresearch_id, pdf_path.name)
                         locations[key] = subresearch_id
                     documents.append({
                         "patent_id": key, "subresearch_id": subresearch_id, "pdf": pdf_path.name,
@@ -443,7 +495,8 @@ def main() -> int:
                 if args.stage == "execute" and pdf_path.is_file():
                     pending_index += 1
                     if pipeline.analysis_checkpoint_current(subresearch_id, pdf_path.name) and not args.overwrite:
-                        analyses[key] = pipeline.load_analysis_artifacts(subresearch_id, pdf_path.name)
+                        if not args.durable_shards:
+                            analyses[key] = pipeline.load_analysis_artifacts(subresearch_id, pdf_path.name)
                         locations[key] = subresearch_id
                         documents.append({
                             "patent_id": key, "subresearch_id": subresearch_id, "pdf": pdf_path.name,
@@ -530,168 +583,230 @@ def main() -> int:
                 if args.stage == "execute":
                     work_items.append({
                         "key": key, "subresearch_id": subresearch_id, "pdf_path": pdf_path,
-                        "prepared": prepared, "record": document_record, "index": progress_index,
+                        "prepared": None if args.durable_shards else prepared,
+                        "record": document_record, "index": progress_index,
                         "audit_dir": prepared["artifact_dir"] / "attempts" / run_id,
                     })
 
+        if args.stage == "execute" and (work_items or analyses or (args.durable_shards and locations)):
+            emit("company_profile", current=0, total=pending_total)
+            model.audit_dir = pipeline.research_dir / "clustering" / run_id / "company_profile"
+            company_profile = model.generate_json("company_profile", {
+                "company_technology": pipeline.research["company_technology"],
+            })
+
         if args.stage == "execute" and work_items:
-            active = {item["key"]: item for item in work_items}
             llm_attempted = len(work_items)
-
-            def record_failure(item: dict, exc: Exception, task: str) -> None:
-                failure = {
-                    "schema_version": 1, "pipeline_version": ANALYSIS_PIPELINE_VERSION,
-                    "run_id": run_id, "patent_id": item["key"], "pdf": item["pdf_path"].name,
-                    "error_type": type(exc).__name__, "error": str(exc),
-                    "failed_stage": getattr(exc, "task", task),
-                    "attempts": getattr(exc, "attempts", 1),
-                    "audit_dir": str(item["audit_dir"].relative_to(ROOT)),
-                    "completed_artifacts": sorted(
-                        path.name for path in item["prepared"]["artifact_dir"].glob("*.json")
-                        if path.name not in {"analysis_error.json", "analysis_complete.json"}
-                    ),
-                    "failed_at": datetime.now(timezone.utc).isoformat(), "retry_on_next_run": True,
-                }
-                atomic_json(item["prepared"]["artifact_dir"] / "analysis_error.json", failure)
-                item["record"].update({"analysis_state": "failed", "analysis_error": failure})
-                document_failures.append(failure)
-                active.pop(item["key"], None)
-                emit(
-                    "document_failed", patent_id=item["key"], error=str(exc),
-                    task=task, task_index=DOCUMENT_TASK_INDEX.get(task, 5), task_total=5,
-                    completed=llm_completed + len(document_failures), processed=llm_completed,
-                    succeeded=llm_completed, failed=len(document_failures), skipped=len(document_skips),
-                    current=llm_completed + len(document_failures), total=pending_total,
-                    percent=round((llm_completed + len(document_failures)) / max(1, pending_total) * 100, 1),
-                )
-
-            # Keep each context class resident: short-context jobs first, then long-context jobs.
             task_order = ("concept_level", "problem_summary", "similarity", "technology_summary")
             calls_per_cooling_period = max(1, min(args.shard_size, args.cooldown_every_documents * len(task_order)))
-            for task in task_order:
-                pending = [
-                    item for item in active.values()
-                    if args.overwrite or not pipeline.analysis_task_current(item["prepared"], task)
-                ]
-                # Context selection is monotonic with prompt size. Sorting keeps
-                # 4K/8K/16K runners contiguous and prevents repeated reloads.
-                pending.sort(
-                    key=lambda item: pipeline.analysis_task_characters(item["prepared"], task),
-                    reverse=task == "technology_summary",
-                )
-                for offset in range(0, len(pending), calls_per_cooling_period):
-                    checkpoint()
-                    group = pending[offset:offset + calls_per_cooling_period]
-                    progress_context.clear()
-                    progress_context.update({
-                        "current": min(pending_total, offset), "total": pending_total,
-                        "processed": llm_completed, "succeeded": llm_completed,
-                        "failed": len(document_failures), "skipped": len(document_skips),
-                    })
+            shards = (
+                [work_items]
+                if not args.durable_shards
+                else [work_items[offset:offset + args.shard_size] for offset in range(0, len(work_items), args.shard_size)]
+            )
+            for shard_index, shard_items in enumerate(shards, 1):
+                checkpoint()
+                if args.durable_shards:
+                    for item in shard_items:
+                        item["prepared"] = pipeline.load_prepared_document(item["subresearch_id"], item["pdf_path"].name)
                     emit(
-                        "llm_batch", **progress_context, task=task,
-                        task_index=DOCUMENT_TASK_INDEX[task], task_total=5,
-                        batch_size=len(group), workers=args.generation_workers,
+                        "shard_started", shard=shard_index, shards=len(shards),
+                        batch_size=len(shard_items), current=llm_completed, total=pending_total,
+                    )
+                active = {item["key"]: item for item in shard_items}
+                shard_analyses: dict[str, dict] = {}
+
+                def record_failure(item: dict, exc: Exception, task: str) -> None:
+                    failure = {
+                        "schema_version": 1, "pipeline_version": ANALYSIS_PIPELINE_VERSION,
+                        "run_id": run_id, "patent_id": item["key"], "pdf": item["pdf_path"].name,
+                        "error_type": type(exc).__name__, "error": str(exc),
+                        "failed_stage": getattr(exc, "task", task),
+                        "attempts": getattr(exc, "attempts", 1),
+                        "audit_dir": str(item["audit_dir"].relative_to(ROOT)),
+                        "completed_artifacts": sorted(
+                            path.name for path in item["prepared"]["artifact_dir"].glob("*.json")
+                            if path.name not in {"analysis_error.json", "analysis_complete.json"}
+                        ),
+                        "failed_at": datetime.now(timezone.utc).isoformat(), "retry_on_next_run": True,
+                    }
+                    atomic_json(item["prepared"]["artifact_dir"] / "analysis_error.json", failure)
+                    item["record"].update({"analysis_state": "failed", "analysis_error": failure})
+                    document_failures.append(failure)
+                    active.pop(item["key"], None)
+                    emit(
+                        "document_failed", patent_id=item["key"], error=str(exc),
+                        task=task, task_index=DOCUMENT_TASK_INDEX.get(task, 5), task_total=5,
+                        completed=llm_completed + len(document_failures), processed=llm_completed,
+                        succeeded=llm_completed, failed=len(document_failures), skipped=len(document_skips),
+                        current=llm_completed + len(document_failures), total=pending_total,
+                        percent=round((llm_completed + len(document_failures)) / max(1, pending_total) * 100, 1),
                     )
 
-                    def run_task(item: dict) -> dict:
-                        return pipeline.analyze_task(
-                            item["prepared"], task,
-                            lambda name, data: model.generate_json(name, data, audit_dir=item["audit_dir"]),
+                # In legacy mode this loop still sees one shard containing every work item.
+                for task in task_order:
+                    pending = [
+                        item for item in active.values()
+                        if args.overwrite or not pipeline.analysis_task_current(item["prepared"], task)
+                    ]
+                    pending.sort(
+                        key=lambda item: pipeline.analysis_task_characters(item["prepared"], task),
+                        reverse=task == "technology_summary",
+                    )
+                    for offset in range(0, len(pending), calls_per_cooling_period):
+                        checkpoint()
+                        group = pending[offset:offset + calls_per_cooling_period]
+                        progress_context.clear()
+                        progress_context.update({
+                            "current": llm_completed, "total": pending_total,
+                            "processed": llm_completed, "succeeded": llm_completed,
+                            "failed": len(document_failures), "skipped": len(document_skips),
+                        })
+                        emit(
+                            "llm_batch", **progress_context, task=task,
+                            task_index=DOCUMENT_TASK_INDEX[task], task_total=5,
+                            batch_size=len(group), workers=args.generation_workers,
+                            shard=shard_index, shards=len(shards),
                         )
 
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=args.generation_workers) as executor:
-                        futures = {executor.submit(run_task, item): item for item in group if item["key"] in active}
-                        for future in concurrent.futures.as_completed(futures):
-                            item = futures[future]
-                            try:
-                                future.result()
-                            except PipelineCancelled:
-                                raise
-                            except (DocumentAnalysisError, ValueError, RuntimeError, OSError) as exc:
-                                record_failure(item, exc, task)
-                    if offset + len(group) < len(pending) and args.cooldown_seconds:
-                        cooldown(f"{task}-batch", min(pending_total, offset + len(group)), pending_total)
+                        def run_task(item: dict) -> dict:
+                            return pipeline.analyze_task(
+                                item["prepared"], task,
+                                lambda name, data: model.generate_json(name, data, audit_dir=item["audit_dir"]),
+                            )
 
-            # Generation is finished for every surviving document. Switch models once.
-            model.unload_generation()
-            embedding_items = list(active.values())
-            documents_per_embedding_batch = max(1, args.embedding_batch_size // 2)
-            for offset in range(0, len(embedding_items), documents_per_embedding_batch):
-                checkpoint()
-                group = [item for item in embedding_items[offset:offset + documents_per_embedding_batch] if item["key"] in active]
-                if not group:
-                    continue
-                flat_inputs: list[str] = []
-                for item in group:
-                    generated = pipeline.assemble_generated_analysis(item["prepared"])
-                    flat_inputs.extend([
-                        generated["summaries"]["tech_summary"], generated["summaries"]["problem_summary"],
-                    ])
-                emit(
-                    "llm_batch", task="embeddings", task_index=5, task_total=5,
-                    batch_size=len(group), current=offset, total=pending_total,
-                    processed=llm_completed, succeeded=llm_completed,
-                    failed=len(document_failures), skipped=len(document_skips),
-                )
-                try:
-                    vectors = model.embed(flat_inputs)
-                    if len(vectors) != len(flat_inputs):
-                        raise ValueError(f"expected {len(flat_inputs)} embeddings, got {len(vectors)}")
-                    for index, item in enumerate(group):
-                        analyses[item["key"]] = pipeline.write_embedding(
-                            item["prepared"], vectors[index * 2:index * 2 + 2],
-                        )
-                except PipelineCancelled:
-                    raise
-                except (DocumentAnalysisError, ValueError, RuntimeError, OSError):
-                    # Retry singly so one malformed embedding cannot discard the whole batch.
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=args.generation_workers) as executor:
+                            futures = {executor.submit(run_task, item): item for item in group if item["key"] in active}
+                            for future in concurrent.futures.as_completed(futures):
+                                item = futures[future]
+                                try:
+                                    future.result()
+                                except PipelineCancelled:
+                                    raise
+                                except (DocumentAnalysisError, ValueError, RuntimeError, OSError) as exc:
+                                    record_failure(item, exc, task)
+                        if offset + len(group) < len(pending) and args.cooldown_seconds:
+                            cooldown(f"{task}-batch", llm_completed, pending_total)
+
+                model.unload_generation()
+                embedding_items = list(active.values())
+                documents_per_embedding_batch = max(1, args.embedding_batch_size // 2)
+                for offset in range(0, len(embedding_items), documents_per_embedding_batch):
+                    checkpoint()
+                    group = [item for item in embedding_items[offset:offset + documents_per_embedding_batch] if item["key"] in active]
+                    if not group:
+                        continue
+                    flat_inputs: list[str] = []
                     for item in group:
-                        try:
-                            generated = pipeline.assemble_generated_analysis(item["prepared"])
-                            inputs = [generated["summaries"]["tech_summary"], generated["summaries"]["problem_summary"]]
-                            analyses[item["key"]] = pipeline.write_embedding(item["prepared"], model.embed(inputs))
-                        except (DocumentAnalysisError, ValueError, RuntimeError, OSError) as exc:
-                            record_failure(item, exc, "embeddings")
+                        generated = pipeline.assemble_generated_analysis(item["prepared"])
+                        flat_inputs.extend([generated["summaries"]["tech_summary"], generated["summaries"]["problem_summary"]])
+                    emit(
+                        "llm_batch", task="embeddings", task_index=5, task_total=5,
+                        batch_size=len(group), current=llm_completed + offset, total=pending_total,
+                        processed=llm_completed, succeeded=llm_completed,
+                        failed=len(document_failures), skipped=len(document_skips),
+                        shard=shard_index, shards=len(shards),
+                    )
+                    try:
+                        vectors = model.embed(flat_inputs)
+                        if len(vectors) != len(flat_inputs):
+                            raise ValueError(f"expected {len(flat_inputs)} embeddings, got {len(vectors)}")
+                        for index, item in enumerate(group):
+                            shard_analyses[item["key"]] = pipeline.write_embedding(
+                                item["prepared"], vectors[index * 2:index * 2 + 2],
+                            )
+                    except PipelineCancelled:
+                        raise
+                    except (DocumentAnalysisError, ValueError, RuntimeError, OSError):
+                        for item in group:
+                            try:
+                                generated = pipeline.assemble_generated_analysis(item["prepared"])
+                                inputs = [generated["summaries"]["tech_summary"], generated["summaries"]["problem_summary"]]
+                                shard_analyses[item["key"]] = pipeline.write_embedding(item["prepared"], model.embed(inputs))
+                            except (DocumentAnalysisError, ValueError, RuntimeError, OSError) as exc:
+                                record_failure(item, exc, "embeddings")
 
+                for item in shard_items:
+                    if item["key"] not in shard_analyses:
+                        continue
+                    locations[item["key"]] = item["subresearch_id"]
+                    llm_completed += 1
+                    error_path = item["prepared"]["artifact_dir"] / "analysis_error.json"
+                    if error_path.exists():
+                        error_path.unlink()
+                    item["record"]["analysis_state"] = "analyzed"
+                    atomic_json(item["prepared"]["artifact_dir"] / "analysis_complete.json", {
+                        "schema_version": 1, "patent_id": item["key"],
+                        "pdf_sha256": item["prepared"]["source_decision"]["pdf_sha256"],
+                        "pipeline_version": ANALYSIS_PIPELINE_VERSION, "run_id": run_id,
+                        "generation_model": args.generation_model, "embedding_model": args.embedding_model,
+                        "audit_dir": str(item["audit_dir"].relative_to(ROOT)),
+                        "runtime": {
+                            "generation_workers": args.generation_workers,
+                            "embedding_batch_size": args.embedding_batch_size,
+                            "shard_size": args.shard_size, "durable_shards": args.durable_shards,
+                            "keep_alive": args.keep_alive,
+                        },
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    emit(
+                        "document_completed", patent_id=item["key"], completed=llm_completed,
+                        processed=llm_completed, succeeded=llm_completed, failed=len(document_failures),
+                        skipped=len(document_skips), current=llm_completed, total=pending_total,
+                        llm_completed=llm_completed, llm_total=llm_total,
+                        percent=round(llm_completed / max(1, pending_total) * 100, 1),
+                    )
+                if args.durable_shards:
+                    model.unload_embedding()
+                    for item in shard_items:
+                        item["prepared"] = None
+                    shard_analyses.clear()
+                    active.clear()
+                    emit(
+                        "shard_completed", shard=shard_index, shards=len(shards),
+                        completed=llm_completed, current=llm_completed, total=pending_total,
+                        percent=round(llm_completed / max(1, pending_total) * 100, 1),
+                    )
+                else:
+                    analyses.update(shard_analyses)
+
+            if company_profile:
+                emit("company_embedding", current=pending_total, total=pending_total, percent=100)
+                company_inputs = [company_profile["technology_summary"], company_profile["problem_summary"]]
+                company_reference = pipeline.build_company_reference(company_profile, model.embed(company_inputs))
             model.unload_embedding()
-            for item in work_items:
-                if item["key"] not in analyses:
-                    continue
-                locations[item["key"]] = item["subresearch_id"]
-                llm_completed += 1
-                error_path = item["prepared"]["artifact_dir"] / "analysis_error.json"
-                if error_path.exists():
-                    error_path.unlink()
-                item["record"]["analysis_state"] = "analyzed"
-                atomic_json(item["prepared"]["artifact_dir"] / "analysis_complete.json", {
-                    "schema_version": 1, "patent_id": item["key"],
-                    "pdf_sha256": item["prepared"]["source_decision"]["pdf_sha256"],
-                    "pipeline_version": ANALYSIS_PIPELINE_VERSION, "run_id": run_id,
-                    "generation_model": args.generation_model, "embedding_model": args.embedding_model,
-                    "audit_dir": str(item["audit_dir"].relative_to(ROOT)),
-                    "runtime": {
-                        "generation_workers": args.generation_workers,
-                        "embedding_batch_size": args.embedding_batch_size,
-                        "shard_size": args.shard_size,
-                        "keep_alive": args.keep_alive,
-                    },
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
-                })
-                emit(
-                    "document_completed", patent_id=item["key"], completed=llm_completed,
-                    processed=llm_completed, succeeded=llm_completed, failed=len(document_failures),
-                    skipped=len(document_skips), current=llm_completed, total=pending_total,
-                    llm_completed=llm_completed, llm_total=llm_total,
-                    percent=round(llm_completed / max(1, pending_total) * 100, 1),
-                )
+        if company_profile and company_reference is None:
+            model.unload_generation()
+            emit("company_embedding", current=pending_total, total=pending_total, percent=100)
+            company_inputs = [company_profile["technology_summary"], company_profile["problem_summary"]]
+            company_reference = pipeline.build_company_reference(company_profile, model.embed(company_inputs))
+            model.unload_embedding()
         extraction_indexes = write_extraction_indexes(ROOT, pipeline, extraction_entries) if extraction_entries else []
         finalized = None
         if args.stage == "execute":
-            if analyses:
+            should_finalize = bool(analyses or existing_analyses or (args.durable_shards and locations))
+            if should_finalize:
                 checkpoint()
                 processed_count = llm_completed
-                analyses = {**existing_analyses, **analyses}
+                if args.durable_shards:
+                    analyses = {}
+                    failed_keys = {item["patent_id"] for item in document_failures}
+                    emit(
+                        "loading_embeddings", documents=len(patents), processed=processed_count,
+                        current=pending_total, total=pending_total, percent=100,
+                    )
+                    for subresearch_id, pdf_path, _ in patents:
+                        key = patent_key(pdf_path.name)
+                        if key in failed_keys:
+                            continue
+                        if (
+                            pipeline.analysis_checkpoint_current(subresearch_id, pdf_path.name)
+                            or pipeline.result_path(subresearch_id, pdf_path.name).exists()
+                        ):
+                            analyses[key] = pipeline.load_analysis_artifacts(subresearch_id, pdf_path.name)
+                            locations[key] = subresearch_id
+                else:
+                    analyses = {**existing_analyses, **analyses}
                 progress_context.clear()
                 progress_context.update({
                     "processed": pending_total, "succeeded": llm_completed,
@@ -701,7 +816,12 @@ def main() -> int:
                 emit("clustering", documents=len(analyses), processed=processed_count, completed=pending_total, current=pending_total, total=pending_total, percent=100)
                 model.audit_dir = pipeline.research_dir / "clustering" / run_id
                 model.counter = 0
-                finalized = pipeline.finalize_research(analyses, locations, model.generate_json, run_id, args.cluster_count)
+                finalized = pipeline.finalize_research(
+                    analyses, locations, model.generate_json, run_id, args.cluster_count, company_reference,
+                    lambda stage, **detail: emit(
+                        stage, **progress_context, **detail,
+                    ),
+                )
                 finalized["processed"] = processed_count
                 finalized["failed"] = len(document_failures)
                 finalized["failed_documents"] = [item["patent_id"] for item in document_failures]
@@ -730,6 +850,7 @@ def main() -> int:
                     "generation_workers": args.generation_workers,
                     "embedding_batch_size": args.embedding_batch_size,
                     "shard_size": args.shard_size,
+                    "durable_shards": args.durable_shards,
                     "cooldown_seconds": args.cooldown_seconds,
                     "cooldown_every_documents": args.cooldown_every_documents,
                     "keep_alive": args.keep_alive,

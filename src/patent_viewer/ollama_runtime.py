@@ -5,6 +5,7 @@ import os
 import shutil
 import socket
 import subprocess
+import ctypes
 import time
 import urllib.error
 import urllib.request
@@ -33,6 +34,8 @@ class AdaptiveRuntimeConfig:
     embedding_batch_size: int
     shard_size: int
     cooldown_every_documents: int
+    system_memory_mib: int = 0
+    durable_shards: bool = False
     max_loaded_models: int = 1
     keep_alive: str = "1h"
 
@@ -75,23 +78,50 @@ def detect_nvidia_gpu() -> GpuInfo | None:
     return max(candidates, key=lambda item: item.free_mib, default=None)
 
 
+def detect_system_memory_mib() -> int:
+    """Return installed physical memory without adding a third-party dependency."""
+    if os.name == "nt":
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_ulong), ("memory_load", ctypes.c_ulong),
+                ("total_physical", ctypes.c_ulonglong), ("available_physical", ctypes.c_ulonglong),
+                ("total_page_file", ctypes.c_ulonglong), ("available_page_file", ctypes.c_ulonglong),
+                ("total_virtual", ctypes.c_ulonglong), ("available_virtual", ctypes.c_ulonglong),
+                ("available_extended_virtual", ctypes.c_ulonglong),
+            ]
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(MemoryStatus)
+        try:
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.total_physical // MIB)
+        except (AttributeError, OSError):
+            return 0
+        return 0
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // MIB)
+    except (AttributeError, OSError, ValueError):
+        return 0
+
+
 def adaptive_runtime_config(
     gpu: GpuInfo | None,
     generation_workers: int | None = None,
     embedding_batch_size: int | None = None,
+    system_memory_mib: int | None = None,
 ) -> AdaptiveRuntimeConfig:
     """Derive safe throughput settings from memory capacity, not GPU labels.
 
     The estimates deliberately include headroom. A later real-model benchmark may
     override these values without changing the pipeline implementation.
     """
+    memory_mib = detect_system_memory_mib() if system_memory_mib is None else max(0, system_memory_mib)
     if gpu is None:
         workers = generation_workers or 1
         return AdaptiveRuntimeConfig(
             mode="fallback", gpu=None, reserved_mib=0,
             generation_workers=max(1, workers),
             embedding_batch_size=embedding_batch_size or 16,
-            shard_size=250, cooldown_every_documents=50,
+            shard_size=250, cooldown_every_documents=50, system_memory_mib=memory_mib,
         )
     reserved = max(2048, round(gpu.total_mib * 0.15))
     usable = max(0, min(gpu.total_mib - reserved, gpu.free_mib - 512))
@@ -103,11 +133,13 @@ def adaptive_runtime_config(
     automatic_workers = max(1, min(2, (usable - generation_base_mib) // kv_slot_mib))
     workers = max(1, generation_workers or automatic_workers)
     embed_batch = embedding_batch_size or 32 * workers
+    durable_shards = gpu.total_mib >= 20_000 and memory_mib >= 64 * 1024
     return AdaptiveRuntimeConfig(
         mode="manual" if generation_workers or embedding_batch_size else "auto",
         gpu=gpu, reserved_mib=reserved, generation_workers=workers,
         embedding_batch_size=max(2, embed_batch), shard_size=250 * workers,
-        cooldown_every_documents=50 * workers,
+        cooldown_every_documents=50 * workers, system_memory_mib=memory_mib,
+        durable_shards=durable_shards,
     )
 
 

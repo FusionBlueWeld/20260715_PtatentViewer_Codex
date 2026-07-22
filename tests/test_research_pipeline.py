@@ -14,7 +14,10 @@ from patent_viewer.pipeline import (
     atomic_json,
     chunk_text,
     deterministic_clusters,
+    cluster_centroids,
+    relative_proximity,
     scalable_clusters,
+    semantic_cluster_order,
     extract_claims,
     extract_claims_with_metadata,
     split_sections,
@@ -107,6 +110,16 @@ class ResearchPipelineTests(unittest.TestCase):
         self.assertEqual(first["a"], first["b"])
         self.assertNotEqual(first["a"], first["c"])
 
+    def test_semantic_order_uses_cosine_direction_and_company_proximity(self):
+        vectors = {"a": [1.0, 0.0], "b": [0.9, 0.1], "c": [-1.0, 0.0]}
+        assignments = {"a": 0, "b": 1, "c": 2}
+        centroids = cluster_centroids(vectors, assignments)
+        order = semantic_cluster_order(centroids)
+        self.assertEqual(set(order), {0, 1, 2})
+        self.assertEqual(abs(order.index(0) - order.index(1)), 1)
+        proximity = relative_proximity([1.0, 0.0], centroids)
+        self.assertGreater(proximity[0]["relative_strength"], proximity[2]["relative_strength"])
+
     def test_run_history_is_limited_to_five(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -137,6 +150,28 @@ class ResearchPipelineTests(unittest.TestCase):
             self.assertFalse(pipeline.analysis_checkpoint_current("group", "P1.pdf"))
             checkpoint.write_text(json.dumps({"pipeline_version": ANALYSIS_PIPELINE_VERSION}), encoding="utf-8")
             self.assertTrue(pipeline.analysis_checkpoint_current("group", "P1.pdf"))
+
+    def test_prepared_document_can_be_reloaded_for_a_durable_shard(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            research_dir = root / "researches/sample"
+            artifact = research_dir / "subresearches/group/pipeline/P1"
+            cache = root / "runtime/shared/extractions/hash"
+            artifact.mkdir(parents=True)
+            cache.mkdir(parents=True)
+            (research_dir / "research.json").write_text("{}", encoding="utf-8")
+            (cache / "extracted_text.txt").write_text("patent text", encoding="utf-8")
+            atomic_json(artifact / "source_decision.json", {
+                "shared_cache": str(cache.relative_to(root)), "pdf_sha256": "hash",
+            })
+            atomic_json(artifact / "document_structure.json", {
+                "claims": [{"number": 1, "type": "independent", "text": "claim"}], "sections": {},
+            })
+            pipeline = ResearchPipeline(root, "normal", "sample")
+            prepared = pipeline.load_prepared_document("group", "P1.pdf")
+            self.assertEqual(prepared["artifact_dir"], artifact)
+            self.assertEqual(prepared["cache_dir"], cache.resolve())
+            self.assertEqual(prepared["structure"]["claims"][0]["number"], 1)
 
     def test_staged_analysis_finalizes_ui_compatible_result(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -173,13 +208,21 @@ class ResearchPipelineTests(unittest.TestCase):
             analysis = pipeline.analyze_document(prepared, generate, lambda texts: [[float(index)] * 128 for index, _ in enumerate(texts, 1)])
             for task in ("similarity", "concept_level", "problem_summary", "technology_summary"):
                 self.assertTrue(pipeline.analysis_task_current(prepared, task))
-            finalized = pipeline.finalize_research({"P1": analysis}, {"P1": "group"}, generate, "run-1")
+            company_reference = pipeline.build_company_reference(
+                {"technology_summary": "自社技術", "problem_summary": "自社課題"},
+                [[1.0] * 128, [1.0] * 128],
+            )
+            finalized = pipeline.finalize_research({"P1": analysis}, {"P1": "group"}, generate, "run-1", company_reference=company_reference)
             result_path = root / finalized["results"]["P1"]
             result = json.loads(result_path.read_text(encoding="utf-8"))
             self.assertEqual(result["similarity"], 3)
             self.assertEqual(result["concept_level"], 4)
             self.assertEqual(result["tech_cluster"], "分類")
-            self.assertEqual(set(result), {"similarity", "concept_level", "tech_summary", "problem_summary", "reasoning", "tech_cluster", "problem_cluster"})
+            self.assertEqual(result["tech_cluster_id"], 0)
+            self.assertEqual(result["problem_cluster_id"], 0)
+            clusters = json.loads((research_dir / "clustering/run-1/clusters.json").read_text(encoding="utf-8"))
+            self.assertEqual(clusters["semantic_ordering"]["technology_order"], [0])
+            self.assertIn("company_proximity", clusters)
             reloaded = pipeline.load_analysis_artifacts("group", "P1.pdf")
             self.assertEqual(reloaded["score"]["similarity"], 3)
             self.assertEqual(reloaded["summaries"]["tech_summary"], "技術")

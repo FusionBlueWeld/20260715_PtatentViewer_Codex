@@ -89,7 +89,7 @@ PDF選択、小型プロンプト5件、小型JSON Schema 5件、出力分離、
 
 ## 段階分析パイプライン
 
-通常の複数文献分析は、PDF抽出と章・請求項分割をPythonで行った後、ローカルLLMへ「類似度」「権利範囲の広さ」「課題要約」「技術要約」の4つの小さなJSONだけを個別に要求します。各要求には専用の小さなJSON Schemaを適用し、Ollamaの生成制約に加えてPythonでも型、必須キー、追加キー、値域、文字数を再検証します。その後、2要約のEmbedding、リサーチ内クラスタ、短いクラスタ名生成を実行します。
+通常の複数文献分析は、PDF抽出と章・請求項分割をPythonで行った後、ローカルLLMへ「類似度」「権利範囲の広さ」「課題要約」「技術要約」の4つの小さなJSONだけを個別に要求します。各要求には専用の小さなJSON Schemaを適用し、Ollamaの生成制約に加えてPythonでも型、必須キー、追加キー、値域、文字数を再検証します。その後、自社技術定義を技術・対象課題の2要約へ一度だけ正規化し、文献と自社のEmbedding、リサーチ内クラスタ、短いクラスタ名、コサイン距離による意味順と自社近接度を確定します。
 
 ```powershell
 python tools/run_research_pipeline.py laser_process_landscape --stage plan
@@ -99,11 +99,11 @@ python tools/run_research_pipeline.py laser_process_landscape --stage execute
 
 共有抽出キャッシュは `runtime/shared/extractions/` に置きますが、元PDFを常に正とし、リサーチ／文献ごとに再抽出や全文読解を選べます。脅威マップは従来どおり「自社技術との類似度 × 権利範囲の広さ」の5×5です。詳細は [docs/RESEARCH_PIPELINE_DESIGN.md](docs/RESEARCH_PIPELINE_DESIGN.md) を参照してください。
 
-同じ操作は画面上部の `夜間一括分析` から、Codexを介さず実行できます。アプリは既存の11434番Ollamaに干渉せず、空きローカルポートで専用Ollamaを起動・監視・終了します。GPUの総VRAMと空きVRAMから生成並列数、Embeddingバッチ数、冷却間隔を自動決定し、短文タスク、長文タスク、Embeddingの順にまとめてモデル再ロードを抑えます。冷却待機中もモデルはVRAMに保持し、生成完了後に一度だけEmbeddingモデルへ切り替えます。文献別の `analysis_progress.json` に完了タスクを保存するため、停止後は文献全体ではなく未完了タスクから再開します。1文献のJSON生成・Schema検証・Embedding検証に失敗した場合は、その文献だけを失敗として記録して次文献へ進みます。要求と応答は文献別の `attempts/<run-id>/llm_calls/`、最新失敗は `analysis_error.json`、run全体の設定・失敗・スキップ一覧は `run_manifest.json` に保存します。pause/resume/cancelが使用でき、実行中はブラウザが閉じてもサーバーのアイドル終了を抑止します。
+同じ操作は画面上部の `夜間一括分析` から、Codexを介さず実行できます。`全件を再分析`を選べば既存結果を手動削除せずに全PDFを更新できます。アプリは既存の11434番Ollamaに干渉せず、空きローカルポートで専用Ollamaを起動・監視・終了します。GPUの総VRAMと空きVRAMから生成並列数とEmbeddingバッチ数を自動決定し、短文タスク、長文タスク、Embeddingの順にまとめてモデル再ロードを抑えます。UIでは冷却時間を0〜180秒（既定0）で指定でき、現在工程、工程経過、総経過、推定残り、工程別実績を確認できます。冷却待機中もモデルはVRAMに保持します。文献別の `analysis_progress.json` に完了タスクを保存するため、停止後は文献全体ではなく未完了タスクから再開します。1文献のJSON生成・Schema検証・Embedding検証に失敗した場合は、その文献だけを失敗として記録して次文献へ進みます。要求と応答は文献別の `attempts/<run-id>/llm_calls/`、最新失敗は `analysis_error.json`、run全体の設定・失敗・スキップ一覧は `run_manifest.json` に保存します。pause/resume/cancelが使用でき、実行中はブラウザが閉じてもサーバーのアイドル終了を抑止します。
 
 大規模リサーチでは、全ペア距離を保持する階層クラスタリングを使用せず、正規化・固定射影・決定的MiniBatch cosine K-meansへ自動的に切り替えます。クラスタ名生成は各クラスタから最大20件の要約を使い、16Kコンテキストを超えないよう制限します。
 
-通常はVRAM自動設定を使用します。検証時だけ上書きする場合は、アプリサーバーへ `--generation-workers 1`、`--embedding-batch-size 32` のように指定できます。指定しなければGPU名や16/24GBラベルではなく、その起動時点の総VRAMと空きVRAMから決定します。採用値は `/api/health`、pipeline job、`run_manifest.json` に記録されます。
+通常はVRAM自動設定を使用します。検証時だけ上書きする場合は、アプリサーバーへ `--generation-workers 1`、`--embedding-batch-size 32` のように指定できます。指定しなければGPU名ではなく、その起動時点の総VRAMと空きVRAMから決定します。GPUが20GB以上かつCPUメモリが64GB以上なら本番向け永続シャードモードとなり、500件ずつ分析・Embeddingを確定してメモリを解放し、全シャード完了後に保存済みEmbeddingを再読込してリサーチ全体を一度だけクラスタリングします。それ未満の環境では従来どおり一括フローを使用します。採用値は `/api/health`、pipeline job、`run_manifest.json` に記録されます。
 
 PDFテキスト抽出と章・請求項構造化だけを先に行う場合は、画面でリサーチを選び、`夜間一括分析` を開いて `前処理だけ実行` を押します。この操作ではOllamaによる意味分析を実行しません。
 

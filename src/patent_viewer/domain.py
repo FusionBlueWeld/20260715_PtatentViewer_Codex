@@ -355,6 +355,38 @@ class Repository:
                 }
                 record.update(analysis)
                 patents.append(record)
+        technology_map: dict[str, Any] = {}
+        clustering_root = research_dir / "clustering"
+        if clustering_root.is_dir():
+            for run_dir in sorted((item for item in clustering_root.iterdir() if item.is_dir()), reverse=True):
+                clusters_path = run_dir / "clusters.json"
+                if not clusters_path.is_file():
+                    continue
+                clusters = read_json(clusters_path)
+                ordering = clusters.get("semantic_ordering", {})
+                proximity = clusters.get("company_proximity", {})
+                technology_names = clusters.get("technology_cluster_names", {})
+                problem_names = clusters.get("problem_cluster_names", {})
+
+                def cluster_metadata(names: dict, values: dict) -> dict[str, Any]:
+                    return {
+                        str(cluster_id): {
+                            "name": name,
+                            **values.get(str(cluster_id), values.get(cluster_id, {})),
+                        }
+                        for cluster_id, name in names.items()
+                    }
+
+                technology_map = {
+                    "run_id": run_dir.name,
+                    "algorithm": ordering.get("algorithm"),
+                    "proximity_scale": proximity.get("scale"),
+                    "technology_order": [str(item) for item in ordering.get("technology_order", [])],
+                    "problem_order": [str(item) for item in ordering.get("problem_order", [])],
+                    "technology_clusters": cluster_metadata(technology_names, proximity.get("technology", {})),
+                    "problem_clusters": cluster_metadata(problem_names, proximity.get("problem", {})),
+                }
+                break
         return {
             "environment": environment,
             "research": {
@@ -365,6 +397,7 @@ class Repository:
             },
             "pool_count": len(list(paths.pool.glob("*.pdf"))),
             "input": input_audit,
+            "technology_map": technology_map,
             "patents": patents,
         }
 
@@ -402,7 +435,7 @@ class Repository:
         research_dir = paths.researches / safe_id(research_id, "research id")
         required_prompt_names = {
             "similarity.txt", "concept_level.txt", "problem_summary.txt",
-            "technology_summary.txt", "cluster_name.txt",
+            "technology_summary.txt", "cluster_name.txt", "company_profile.txt",
         }
         stage_prompt_dir = self.root / "src/patent_viewer/prompts/stages"
         installed_prompt_names = {
@@ -412,7 +445,7 @@ class Repository:
         required_schema_names = {
             "llm-similarity.schema.json", "llm-concept-level.schema.json",
             "llm-problem-summary.schema.json", "llm-technology-summary.schema.json",
-            "llm-cluster-name.schema.json",
+            "llm-cluster-name.schema.json", "llm-company-profile.schema.json",
         }
         schema_dir = self.root / "schemas"
         installed_schema_names: set[str] = set()
@@ -465,7 +498,7 @@ class Repository:
         structure_ok = structure_total > 0 and structure_valid == structure_total
         checks = [
             {"id": "pdf-selection", "ok": bool(dashboard["patents"]), "detail": f"{len(dashboard['patents'])}件"},
-            {"id": "prompts", "ok": prompt_contract_ok, "detail": f"小型プロンプト {len(required_prompt_names & installed_prompt_names)}/5・Schema {len(required_schema_names & installed_schema_names)}/5"},
+            {"id": "prompts", "ok": prompt_contract_ok, "detail": f"小型プロンプト {len(required_prompt_names & installed_prompt_names)}/{len(required_prompt_names)}・Schema {len(required_schema_names & installed_schema_names)}/{len(required_schema_names)}"},
             {"id": "output-isolation", "ok": self.paths(environment).runtime != self.paths("debug" if environment == "normal" else "normal").runtime, "detail": str(self.paths(environment).runtime)},
             {"id": "ollama", "ok": ollama_ok, "detail": ollama_detail},
             {"id": "models", "ok": models_ok, "detail": "必要モデル導入済み" if models_ok else f"不足: {', '.join(missing_models)}"},

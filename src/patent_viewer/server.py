@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .domain import DataError, Repository
-from .ollama_runtime import ManagedOllama, adaptive_runtime_config, detect_nvidia_gpu
+from .ollama_runtime import ManagedOllama, adaptive_runtime_config, detect_nvidia_gpu, detect_system_memory_mib
 from .pipeline import ResearchPipeline, atomic_json
 
 
@@ -41,7 +41,7 @@ class AppState:
         self.server = None
         self.runtime_config = adaptive_runtime_config(
             detect_nvidia_gpu(), generation_workers=generation_workers,
-            embedding_batch_size=embedding_batch_size,
+            embedding_batch_size=embedding_batch_size, system_memory_mib=detect_system_memory_mib(),
         )
         self.ollama = ManagedOllama(self.root / "runtime" / "managed_ollama", self.runtime_config) if manage_ollama else None
         if self.ollama is not None:
@@ -65,8 +65,8 @@ class AppState:
         if mode not in {"prepare", "execute"}:
             raise DataError("pipeline modeはprepareまたはexecuteです")
         ResearchPipeline(self.root, environment, research_id)
-        if not 0 <= cooldown_seconds <= 3600:
-            raise DataError("cooldown_secondsは0〜3600秒で指定してください")
+        if not 0 <= cooldown_seconds <= 180:
+            raise DataError("cooldown_secondsは0〜180秒で指定してください")
         with self.lock:
             for existing in self.pipeline_jobs.values():
                 active = self.pipeline_job(existing["id"])["status"] in {"running", "paused", "cancelling"}
@@ -93,6 +93,8 @@ class AppState:
                 "--cooldown-every-documents", str(self.runtime_config.cooldown_every_documents),
                 "--keep-alive", self.runtime_config.keep_alive,
             ]
+            if self.runtime_config.durable_shards:
+                command.append("--durable-shards")
             if overwrite:
                 command.append("--overwrite")
             if mode == "execute" and cooldown_seconds:
@@ -102,6 +104,7 @@ class AppState:
             process = subprocess.Popen(command, cwd=self.root, stdout=stdout_handle, stderr=stderr_handle, shell=False)
             job = {
                 "id": job_id, "environment": environment, "research_id": research_id, "mode": mode,
+                "overwrite": overwrite,
                 "cooldown_seconds": cooldown_seconds,
                 "runtime_config": self.runtime_config.as_dict(),
                 "ollama_runtime": self.ollama.status() if self.ollama else {"managed": False},

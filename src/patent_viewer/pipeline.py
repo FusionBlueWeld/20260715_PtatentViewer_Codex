@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterable
 
 from pypdf import PdfReader
 
-from .domain import DataError, patent_key, read_company_technology, read_research_config, research_sources, read_json, safe_id
+from .domain import DataError, patent_key, read_company_technology, read_research_config, research_patents, read_json, safe_id
 
 
 READING_MODES = {"cache", "verify_original", "reextract"}
@@ -525,38 +525,57 @@ class ResearchPipeline:
         if self.research_dir.parent != base.resolve() or not self.research_dir.is_dir():
             raise DataError("リサーチが見つかりません")
         self.research = read_research_config(self.research_dir)
+        if self.research.get("lifecycle", {}).get("status", "active") == "archived":
+            raise DataError("アーカイブ済みリサーチは分析できません")
         self.research["company_technology"] = read_company_technology(self.research_dir, self.research)
-        self.sources, self.input_audit = research_sources(self.research_dir, self.root / "patent_pool")
+        self.documents, self.input_audit = research_patents(self.research_dir, self.root / "patent_pool")
+        self.legacy_locations = {
+            patent_key(str(patent.get("pdf", ""))): str(patent["_legacy_subresearch_id"])
+            for patent in self.documents if patent.get("_legacy_subresearch_id")
+        }
         self.cache = SharedExtractionCache(self.root / "runtime/shared/extractions")
 
-    def patents(self) -> list[tuple[str, Path, dict[str, Any]]]:
-        output: list[tuple[str, Path, dict[str, Any]]] = []
+    def patents(self) -> list[tuple[Path, dict[str, Any]]]:
+        output: list[tuple[Path, dict[str, Any]]] = []
         seen: set[str] = set()
-        for source in self.sources:
-            sub_id = source["id"]
-            for patent in source["patents"]:
-                pdf_name = str(patent.get("pdf", ""))
-                if Path(pdf_name).name != pdf_name or not pdf_name.lower().endswith(".pdf"):
-                    raise DataError(f"不正なPDF参照です: {pdf_name}")
-                key = patent_key(pdf_name)
-                if key in seen:
-                    raise DataError(f"同一リサーチ内でPDFが重複しています: {pdf_name}")
-                pdf_path = (self.root / "patent_pool" / pdf_name).resolve()
-                if pdf_path.parent != (self.root / "patent_pool").resolve():
-                    raise DataError(f"不正なPDF参照です: {pdf_name}")
-                seen.add(key)
-                output.append((sub_id, pdf_path, patent))
+        for patent in self.documents:
+            pdf_name = str(patent.get("pdf", ""))
+            if Path(pdf_name).name != pdf_name or not pdf_name.lower().endswith(".pdf"):
+                raise DataError(f"不正なPDF参照です: {pdf_name}")
+            key = patent_key(pdf_name)
+            if key in seen:
+                raise DataError(f"同一リサーチ内でPDFが重複しています: {pdf_name}")
+            pdf_path = (self.root / "patent_pool" / pdf_name).resolve()
+            if pdf_path.parent != (self.root / "patent_pool").resolve():
+                raise DataError(f"不正なPDF参照です: {pdf_name}")
+            seen.add(key)
+            output.append((pdf_path, patent))
         return output
 
-    def artifact_dir(self, subresearch_id: str, pdf_name: str) -> Path:
-        return self.research_dir / "subresearches" / subresearch_id / "pipeline" / patent_key(pdf_name)
+    def artifact_dir(self, pdf_name: str) -> Path:
+        return self.research_dir / "pipeline" / patent_key(pdf_name)
 
-    def result_path(self, subresearch_id: str, pdf_name: str) -> Path:
-        return self.research_dir / "subresearches" / subresearch_id / "results" / f"{patent_key(pdf_name)}.json"
+    def _legacy_artifact_dir(self, pdf_name: str) -> Path | None:
+        legacy_id = self.legacy_locations.get(patent_key(pdf_name))
+        return self.research_dir / "subresearches" / legacy_id / "pipeline" / patent_key(pdf_name) if legacy_id else None
 
-    def load_analysis_artifacts(self, subresearch_id: str, pdf_name: str) -> dict[str, Any]:
+    def _read_artifact_dir(self, pdf_name: str) -> Path:
+        current = self.artifact_dir(pdf_name)
+        legacy = self._legacy_artifact_dir(pdf_name)
+        return current if current.exists() or not legacy or not legacy.exists() else legacy
+
+    def result_path(self, pdf_name: str) -> Path:
+        return self.research_dir / "results" / f"{patent_key(pdf_name)}.json"
+
+    def existing_result_path(self, pdf_name: str) -> Path:
+        current = self.result_path(pdf_name)
+        legacy_id = self.legacy_locations.get(patent_key(pdf_name))
+        legacy = self.research_dir / "subresearches" / str(legacy_id) / "results" / f"{patent_key(pdf_name)}.json"
+        return current if current.exists() or not legacy_id or not legacy.exists() else legacy
+
+    def load_analysis_artifacts(self, pdf_name: str) -> dict[str, Any]:
         """Reload completed stage artifacts without invoking an LLM again."""
-        artifact = self.artifact_dir(subresearch_id, pdf_name)
+        artifact = self._read_artifact_dir(pdf_name)
         required = {
             "score": "threat_score.json",
             "summaries": "summaries.json",
@@ -567,9 +586,9 @@ class ResearchPipeline:
             raise DataError(f"処理済み結果の段階成果物が不足しています: {patent_key(pdf_name)} ({', '.join(missing)})")
         return {"artifact_dir": artifact, **{key: read_json(artifact / filename) for key, filename in required.items()}}
 
-    def load_prepared_document(self, subresearch_id: str, pdf_name: str) -> dict[str, Any]:
+    def load_prepared_document(self, pdf_name: str) -> dict[str, Any]:
         """Reload preparation artifacts so production shards need not retain document text in RAM."""
-        artifact = self.artifact_dir(subresearch_id, pdf_name)
+        artifact = self._read_artifact_dir(pdf_name)
         source_decision = read_json(artifact / "source_decision.json")
         structure = read_json(artifact / "document_structure.json")
         cache_dir = (self.root / source_decision["shared_cache"]).resolve()
@@ -580,8 +599,8 @@ class ResearchPipeline:
             "source_decision": source_decision, "structure": structure,
         }
 
-    def analysis_checkpoint_current(self, subresearch_id: str, pdf_name: str) -> bool:
-        checkpoint = self.artifact_dir(subresearch_id, pdf_name) / "analysis_complete.json"
+    def analysis_checkpoint_current(self, pdf_name: str) -> bool:
+        checkpoint = self._read_artifact_dir(pdf_name) / "analysis_complete.json"
         if not checkpoint.is_file():
             return False
         try:
@@ -592,8 +611,8 @@ class ResearchPipeline:
     def overview(self) -> dict[str, Any]:
         documents = self.patents()
         items = []
-        for subresearch_id, pdf_path, patent in documents:
-            artifact = self.artifact_dir(subresearch_id, pdf_path.name)
+        for pdf_path, patent in documents:
+            artifact = self._read_artifact_dir(pdf_path.name)
             skip_path = artifact / "skip.json"
             skip = read_json(skip_path) if skip_path.exists() else {}
             error_path = artifact / "analysis_error.json"
@@ -605,10 +624,10 @@ class ResearchPipeline:
                 "similarity": "similarity.json", "concept_level": "concept_level.json",
                 "threat_score": "threat_score.json", "summaries": "summaries.json", "embeddings": "embeddings.json",
             }.items()}
-            checkpoint = self.analysis_checkpoint_current(subresearch_id, pdf_path.name)
-            result = self.result_path(subresearch_id, pdf_path.name)
+            checkpoint = self.analysis_checkpoint_current(pdf_path.name)
+            result = self.existing_result_path(pdf_path.name)
             items.append({
-                "patent_id": patent_key(pdf_path.name), "pdf": pdf_path.name, "subresearch_id": subresearch_id,
+                "patent_id": patent_key(pdf_path.name), "pdf": pdf_path.name,
                 "source_policy": SourcePolicy.from_values(self.research, patent).__dict__, "stages": files, "finalized": result.exists(),
                 "analysis_checkpoint": checkpoint,
                 "analysis_error": analysis_error,
@@ -621,6 +640,7 @@ class ResearchPipeline:
             "source_policy": self.research.get("pipeline", {}).get("source_policy", {}),
             "threat_map": self.research.get("pipeline", {}).get("threat_scoring", {}),
             "input": self.input_audit,
+            "analysis_stale": bool(self.research.get("lifecycle", {}).get("analysis_stale", False)),
             "stages": list(PIPELINE_STAGES),
             "documents": items,
             "counts": {
@@ -636,11 +656,22 @@ class ResearchPipeline:
             },
         }
 
-    def prepare_document(self, subresearch_id: str, pdf_path: Path, patent: dict[str, Any]) -> dict[str, Any]:
+    def mark_analysis_current(self) -> None:
+        config = read_research_config(self.research_dir)
+        lifecycle = dict(config.get("lifecycle", {}))
+        lifecycle["analysis_stale"] = False
+        lifecycle["updated_at"] = utc_now()
+        lifecycle.setdefault("status", "active")
+        lifecycle.setdefault("created_at", lifecycle["updated_at"])
+        config["schema_version"] = max(2, int(config.get("schema_version", 0)))
+        config["lifecycle"] = lifecycle
+        atomic_json(self.research_dir / "research.json", config)
+
+    def prepare_document(self, pdf_path: Path, patent: dict[str, Any]) -> dict[str, Any]:
         policy = SourcePolicy.from_values(self.research, patent)
         cache_dir, extraction = self.cache.obtain(pdf_path, policy.extraction)
         text = (cache_dir / "extracted_text.txt").read_text(encoding="utf-8")
-        artifact = self.artifact_dir(subresearch_id, pdf_path.name)
+        artifact = self.artifact_dir(pdf_path.name)
         sections = split_sections(text)
         claims, claim_validation = extract_claims_with_metadata(text)
         if not claim_validation["valid"]:
@@ -985,7 +1016,6 @@ class ResearchPipeline:
     def finalize_research(
         self,
         analyses: dict[str, dict[str, Any]],
-        locations: dict[str, str],
         generate_json: "GenerateJson",
         run_id: str,
         cluster_count: int | None = None,
@@ -1067,7 +1097,7 @@ class ResearchPipeline:
                 "tech_cluster_id": clustering["technology_assignments"][key],
                 "problem_cluster_id": clustering["problem_assignments"][key],
             }
-            result_path = self.research_dir / "subresearches" / locations[key] / "results" / f"{key}.json"
+            result_path = self.research_dir / "results" / f"{key}.json"
             atomic_json(result_path, result)
             results[key] = str(result_path.relative_to(self.root))
         return {

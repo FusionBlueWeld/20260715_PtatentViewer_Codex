@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import csv
 import json
 import re
+import shutil
+import tempfile
 import unicodedata
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +24,13 @@ PATENT_LIST_HEADERS = (
     "出願人・権利者名", "発明の名称", "ステイタス",
 )
 PATENT_LIST_NAME = re.compile(r"^patent_list_(\d{14})\.csv$")
+ORGANIZATION_ID = re.compile(r"^org_[0-9a-f]{16}$")
+GROUP_ID = re.compile(r"^group_[0-9a-f]{16}$")
+DEFAULT_LEGAL_STATUS_RULES = {
+    "version": 1,
+    "rights_acquired": ["登録（権利有）"],
+    "under_examination": ["通常審査中"],
+}
 
 
 class DataError(ValueError):
@@ -80,6 +91,33 @@ def normalize_publication_number(value: str) -> str:
     return re.sub(r"[‐‑‒–—―ー−]", "-", normalized)
 
 
+def applicant_organizations(value: Any) -> list[dict[str, str]]:
+    """Keep source wording, splitting only explicit multi-value separators."""
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not raw or raw in {"未設定", "未調査"}:
+        return []
+    names: list[str] = []
+    for item in re.split(r"[\r\n;；]+", raw):
+        name = re.sub(r"\s+", " ", item).strip()
+        if name and name not in names:
+            names.append(name)
+    return [
+        {"id": f"org_{hashlib.sha256(name.casefold().encode('utf-8')).hexdigest()[:16]}", "name": name}
+        for name in names
+    ]
+
+
+def write_json_atomic(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def infer_year(publication_number: str) -> int | None:
     normalized = normalize_publication_number(publication_number)
     compact = normalized.replace(" ", "")
@@ -100,6 +138,32 @@ def infer_status(publication_number: str) -> str:
     if upper.startswith("JPA") or upper.startswith("WO") or upper.startswith("特開") or upper.startswith("特表"):
         return "published"
     return "unknown"
+
+
+def application_year(value: Any) -> int | None:
+    raw = str(value or "").strip()
+    match = re.fullmatch(r"((?:19|20)\d{2})[./-]\d{1,2}[./-]\d{1,2}", raw)
+    return int(match.group(1)) if match else None
+
+
+def legal_status_rules(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("legal_status_rules", {})
+    rules: dict[str, Any] = {"version": 1}
+    for key in ("rights_acquired", "under_examination"):
+        source = raw.get(key, DEFAULT_LEGAL_STATUS_RULES[key])
+        if not isinstance(source, list):
+            source = DEFAULT_LEGAL_STATUS_RULES[key]
+        rules[key] = list(dict.fromkeys(str(item).strip() for item in source if str(item).strip()))
+    return rules
+
+
+def classify_legal_status(source_status: Any, rules: dict[str, Any]) -> str:
+    value = str(source_status or "").strip()
+    if value in rules.get("rights_acquired", []):
+        return "rights_acquired"
+    if value in rules.get("under_examination", []):
+        return "under_examination"
+    return "published"
 
 
 def read_research_config(research_dir: Path) -> dict[str, Any]:
@@ -220,7 +284,8 @@ def load_patent_list(csv_path: Path, pool: Path) -> tuple[list[dict[str, Any]], 
                     "registration_number": row["登録番号"], "registration_date": row["登録日"].replace(".", "-"),
                     "applicant": row["出願人・権利者名"], "title": row["発明の名称"],
                     "source_status": row["ステイタス"], "source_ai_score": ai_score, "source_no": row_number,
-                    "status": infer_status(display_number), "year": infer_year(display_number),
+                    "status": infer_status(display_number), "year": application_year(row["出願日"]),
+                    "year_source": "application_date",
                     "pdf_match": {"selected": selected, "candidates": matches, "rule": "registration_then_domestic_then_wo"},
                 })
     except UnicodeDecodeError as exc:
@@ -228,22 +293,50 @@ def load_patent_list(csv_path: Path, pool: Path) -> tuple[list[dict[str, Any]], 
     return patents, {"selected_csv": csv_path.name, "warnings": warnings, "rows": len(patents)}
 
 
-def research_sources(research_dir: Path, pool: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def research_patents(research_dir: Path, pool: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load the document set owned by one research.
+
+    CSV is the production source, a research-level patents.json is the JSON
+    source used by fixtures and hand-authored sets, and subresearch manifests
+    are a read-only compatibility fallback.
+    """
     csv_path, excluded = latest_patent_list(research_dir)
     if csv_path:
         patents, audit = load_patent_list(csv_path, pool)
+        for patent in patents:
+            patent["_legacy_subresearch_id"] = "patent_list"
         audit["excluded_older_csvs"] = excluded
-        return [{"id": "patent_list", "name": "特許リスト", "patents": patents}], audit
-    sources = []
+        audit.update({"selected_manifest": None, "legacy_inputs": []})
+        return patents, audit
+    manifest_path = research_dir / "patents.json"
+    if manifest_path.is_file():
+        manifest = read_json(manifest_path)
+        patents = manifest.get("patents", [])
+        if not isinstance(patents, list):
+            raise DataError(f"patentsが配列ではありません: {manifest_path}")
+        return patents, {
+            "selected_csv": None, "selected_manifest": manifest_path.name,
+            "excluded_older_csvs": [], "legacy_inputs": [],
+            "warnings": [], "rows": len(patents),
+        }
+    patents: list[dict[str, Any]] = []
+    legacy_subresearches: list[str] = []
     for manifest_path in sorted((research_dir / "subresearches").glob("*/patents.json")):
         manifest = read_json(manifest_path)
-        sources.append({
-            "id": safe_id(manifest_path.parent.name, "subresearch id"),
-            "name": manifest.get("name", manifest_path.parent.name),
-            "description": manifest.get("description", ""),
-            "patents": manifest.get("patents", []),
-        })
-    return sources, {"selected_csv": None, "excluded_older_csvs": [], "warnings": [], "rows": sum(len(item["patents"]) for item in sources)}
+        legacy_id = safe_id(manifest_path.parent.name, "legacy group id")
+        legacy_name = str(manifest.get("name", legacy_id))
+        legacy_subresearches.append(legacy_id)
+        for item in manifest.get("patents", []):
+            patent = dict(item)
+            patent.setdefault("category", legacy_name)
+            patent["_legacy_subresearch_id"] = legacy_id
+            patents.append(patent)
+    return patents, {
+        "selected_csv": None, "selected_manifest": None,
+        "excluded_older_csvs": [], "legacy_inputs": legacy_subresearches,
+        "warnings": ([{"code": "legacy_subresearch_input"}] if legacy_subresearches else []),
+        "rows": len(patents),
+    }
 
 
 @dataclass(frozen=True)
@@ -273,29 +366,351 @@ class Repository:
             raise DataError("environmentはnormalまたはdebugです")
         return DataPaths(self.root, environment)
 
-    def list_researches(self, environment: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _lifecycle(config: dict[str, Any]) -> dict[str, Any]:
+        raw = config.get("lifecycle", {})
+        return {
+            "status": str(raw.get("status", "active")),
+            "created_at": raw.get("created_at"),
+            "updated_at": raw.get("updated_at"),
+            "archived_at": raw.get("archived_at"),
+            "archive_reason": raw.get("archive_reason"),
+            "analysis_stale": bool(raw.get("analysis_stale", False)),
+        }
+
+    @staticmethod
+    def _csv_history(research_dir: Path) -> list[dict[str, Any]]:
+        active, _ = latest_patent_list(research_dir)
+        items = []
+        for path in research_dir.glob("patent_list_*.csv"):
+            match = PATENT_LIST_NAME.fullmatch(path.name)
+            if not match:
+                continue
+            try:
+                timestamp = datetime.strptime(match.group(1), "%Y%m%d%H%M%S")
+            except ValueError:
+                continue
+            items.append({
+                "filename": path.name,
+                "timestamp": timestamp.isoformat(timespec="seconds"),
+                "active": active == path,
+                "bytes": path.stat().st_size,
+            })
+        return sorted(items, key=lambda item: item["timestamp"], reverse=True)
+
+    def _decode_csv_upload(self, environment: str, filename: str, encoded: str) -> tuple[bytes, list[dict[str, Any]], dict[str, Any]]:
+        match = PATENT_LIST_NAME.fullmatch(filename)
+        if not match:
+            raise DataError("CSV名は patent_list_yyyymmddHHMMSS.csv 形式で指定してください")
+        try:
+            datetime.strptime(match.group(1), "%Y%m%d%H%M%S")
+        except ValueError as exc:
+            raise DataError("CSVファイル名の日時が不正です") from exc
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise DataError("CSVアップロードデータが不正です") from exc
+        if not content or len(content) > 5_000_000:
+            raise DataError("CSVは1バイト以上5MB以下にしてください")
+        paths = self.paths(environment)
+        paths.runtime.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="csv-validation-", dir=paths.runtime) as temp:
+            path = Path(temp) / filename
+            path.write_bytes(content)
+            patents, audit = load_patent_list(path, paths.pool)
+        audit["matched_pdfs"] = sum(bool(item.get("pdf_match", {}).get("selected")) for item in patents)
+        audit["missing_pdfs"] = len(patents) - audit["matched_pdfs"]
+        audit["multiple_candidates"] = sum(len(item.get("pdf_match", {}).get("candidates", [])) > 1 for item in patents)
+        return content, patents, audit
+
+    def validate_research_csv(self, environment: str, filename: str, encoded: str) -> dict[str, Any]:
+        _, patents, audit = self._decode_csv_upload(environment, filename, encoded)
+        return {"ok": True, "filename": filename, "rows": len(patents), **audit}
+
+    def create_research(self, environment: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if environment != "normal":
+            raise DataError("UIからのリサーチ作成はNORMAL環境だけで使用できます")
+        research_id = safe_id(str(payload.get("id", "")).strip(), "research id")
+        name = str(payload.get("name", "")).strip()
+        description = str(payload.get("description", "")).strip()
+        company_technology = str(payload.get("company_technology", "")).strip()
+        if not name or len(name) > 120:
+            raise DataError("リサーチ名は1〜120文字で指定してください")
+        if len(description) > 2_000:
+            raise DataError("説明は2000文字以内で指定してください")
+        if not company_technology or len(company_technology) > 20_000:
+            raise DataError("自社技術は1〜20000文字で指定してください")
+        filename = str(payload.get("csv_filename", ""))
+        content, patents, audit = self._decode_csv_upload(environment, filename, str(payload.get("csv_base64", "")))
+        if not patents:
+            raise DataError("CSVに文献がありません")
+        paths = self.paths(environment)
+        paths.researches.mkdir(parents=True, exist_ok=True)
+        target = (paths.researches / research_id).resolve()
+        if target.parent != paths.researches.resolve() or target.exists():
+            raise DataError("同じIDのリサーチが既に存在します")
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        draft_root = paths.runtime / "research_drafts"
+        draft_root.mkdir(parents=True, exist_ok=True)
+        draft = draft_root / uuid.uuid4().hex
+        try:
+            draft.mkdir()
+            config = {
+                "schema_version": 2,
+                "name": name,
+                "description": description,
+                "legal_status_rules": DEFAULT_LEGAL_STATUS_RULES,
+                "lifecycle": {
+                    "status": "active", "created_at": now, "updated_at": now,
+                    "archived_at": None, "archive_reason": None, "analysis_stale": False,
+                },
+                "pipeline": {
+                    "source_policy": {"extraction": "verify_original", "reading": "adaptive"},
+                    "threat_scoring": {
+                        "map": "5x5", "x_axis": "similarity", "y_axis": "concept_level",
+                        "primary_evidence": "independent_claims", "embedding_is_scoring_evidence": False,
+                    },
+                },
+            }
+            write_json_atomic(draft / "research.json", config)
+            (draft / "company_tech.txt").write_text(company_technology, encoding="utf-8")
+            (draft / filename).write_bytes(content)
+            draft.rename(target)
+        finally:
+            if draft.exists():
+                shutil.rmtree(draft)
+        return {
+            "ok": True, "research_id": research_id, "active_csv": filename,
+            "document_count": len(patents), "validation": audit,
+        }
+
+    def add_research_csv(self, environment: str, research_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        paths = self.paths(environment)
+        research_id = safe_id(research_id, "research id")
+        research_dir = (paths.researches / research_id).resolve()
+        if research_dir.parent != paths.researches.resolve() or not research_dir.is_dir():
+            raise DataError("リサーチが見つかりません")
+        config = read_research_config(research_dir)
+        if self._lifecycle(config)["status"] == "archived":
+            raise DataError("アーカイブ済みリサーチは更新できません")
+        filename = str(payload.get("csv_filename", ""))
+        content, new_patents, audit = self._decode_csv_upload(environment, filename, str(payload.get("csv_base64", "")))
+        old_path, _ = latest_patent_list(research_dir)
+        old_patents = load_patent_list(old_path, paths.pool)[0] if old_path else []
+        target = research_dir / filename
+        if target.exists():
+            if target.read_bytes() != content:
+                raise DataError("同名で内容が異なるCSVは上書きできません。新しいタイムスタンプで作成してください")
+            return {
+                "ok": True, "research_id": research_id, "active_csv": old_path.name if old_path else filename,
+                "active_changed": False, "already_uploaded": True, "validation": audit,
+                "history": self._csv_history(research_dir),
+            }
+        temporary = research_dir / f".{filename}.{uuid.uuid4().hex}.tmp"
+        temporary.write_bytes(content)
+        temporary.replace(target)
+        new_active, _ = latest_patent_list(research_dir)
+        active_changed = new_active == target
+        old_ids = {str(item.get("publication_number") or item.get("pdf")) for item in old_patents}
+        new_ids = {str(item.get("publication_number") or item.get("pdf")) for item in new_patents}
+        if active_changed:
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            lifecycle = dict(config.get("lifecycle", {}))
+            lifecycle.update({"status": "active", "updated_at": now, "analysis_stale": True})
+            config["schema_version"] = max(2, int(config.get("schema_version", 0)))
+            config["lifecycle"] = lifecycle
+            write_json_atomic(research_dir / "research.json", config)
+        return {
+            "ok": True, "research_id": research_id,
+            "active_csv": new_active.name if new_active else None,
+            "active_changed": active_changed, "already_uploaded": False,
+            "diff": {
+                "added": len(new_ids - old_ids), "continued": len(new_ids & old_ids),
+                "removed": len(old_ids - new_ids),
+            } if active_changed else {"added": 0, "continued": len(old_ids), "removed": 0},
+            "validation": audit, "history": self._csv_history(research_dir),
+        }
+
+    def set_research_archived(self, environment: str, research_id: str, archived: bool, reason: str = "") -> dict[str, Any]:
+        paths = self.paths(environment)
+        research_id = safe_id(research_id, "research id")
+        research_dir = (paths.researches / research_id).resolve()
+        if research_dir.parent != paths.researches.resolve() or not research_dir.is_dir():
+            raise DataError("リサーチが見つかりません")
+        config = read_research_config(research_dir)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        lifecycle = dict(config.get("lifecycle", {}))
+        lifecycle.update({
+            "status": "archived" if archived else "active",
+            "updated_at": now,
+            "archived_at": now if archived else None,
+            "archive_reason": reason.strip()[:1_000] if archived else None,
+        })
+        lifecycle.setdefault("created_at", now)
+        lifecycle.setdefault("analysis_stale", False)
+        config["schema_version"] = max(2, int(config.get("schema_version", 0)))
+        config["lifecycle"] = lifecycle
+        write_json_atomic(research_dir / "research.json", config)
+        return {"ok": True, "research_id": research_id, "lifecycle": self._lifecycle(config)}
+
+    def save_legal_status_rules(self, environment: str, research_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        paths = self.paths(environment)
+        research_id = safe_id(research_id, "research id")
+        research_dir = (paths.researches / research_id).resolve()
+        if research_dir.parent != paths.researches.resolve() or not research_dir.is_dir():
+            raise DataError("リサーチが見つかりません")
+
+        rules: dict[str, Any] = {"version": 1}
+        for key, label in (("rights_acquired", "権利化"), ("under_examination", "審査中")):
+            raw = payload.get(key, [])
+            if not isinstance(raw, list):
+                raise DataError(f"{label}の判定テキストは配列で指定してください")
+            values = list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))
+            if len(values) > 100 or any(len(item) > 200 for item in values):
+                raise DataError(f"{label}の判定テキストは100件以内・1件200文字以内で指定してください")
+            rules[key] = values
+        duplicate = set(rules["rights_acquired"]) & set(rules["under_examination"])
+        if duplicate:
+            raise DataError(f"同じ判定テキストを権利化と審査中の両方には登録できません: {sorted(duplicate)[0]}")
+
+        config = read_research_config(research_dir)
+        config["schema_version"] = max(2, int(config.get("schema_version", 0)))
+        config["legal_status_rules"] = rules
+        lifecycle = dict(config.get("lifecycle", {}))
+        lifecycle["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        config["lifecycle"] = lifecycle
+        write_json_atomic(research_dir / "research.json", config)
+        return {"ok": True, "research_id": research_id, "legal_status_rules": rules}
+
+    def _organization_registry_path(self, environment: str) -> Path:
+        self.paths(environment)
+        return self.root / ("config/organization_registry.json" if environment == "normal" else "debug_data/config/organization_registry.json")
+
+    def _research_organization_path(self, environment: str, research_id: str) -> Path:
+        paths = self.paths(environment)
+        research_id = safe_id(research_id, "research id")
+        research_dir = (paths.researches / research_id).resolve()
+        if research_dir.parent != paths.researches.resolve() or not research_dir.is_dir():
+            raise DataError("リサーチが見つかりません")
+        return research_dir / "organization_overrides.json"
+
+    @staticmethod
+    def _read_groups(path: Path, scope: str) -> tuple[list[dict[str, Any]], str | None]:
+        if not path.is_file():
+            return [], None
+        payload = read_json(path)
+        if not isinstance(payload, dict) or not isinstance(payload.get("groups", []), list):
+            raise DataError(f"企業グループ設定が不正です: {path}")
+        groups = []
+        for raw in payload.get("groups", []):
+            if not isinstance(raw, dict):
+                continue
+            group = dict(raw)
+            group["scope"] = scope
+            groups.append(group)
+        return groups, str(payload.get("updated_at") or "") or None
+
+    def organization_registry(self, environment: str, research_id: str, patents: list[dict[str, Any]]) -> dict[str, Any]:
+        shared, shared_version = self._read_groups(self._organization_registry_path(environment), "common")
+        local, local_version = self._read_groups(self._research_organization_path(environment, research_id), "research")
+        organizations: dict[str, str] = {}
+        for patent in patents:
+            entities = applicant_organizations(patent.get("applicant"))
+            patent["applicant_organizations"] = entities
+            patent["applicant_organization_ids"] = [item["id"] for item in entities]
+            organizations.update({item["id"]: item["name"] for item in entities})
+        for group in shared + local:
+            for member in group.get("members", []):
+                if isinstance(member, dict) and ORGANIZATION_ID.fullmatch(str(member.get("id", ""))):
+                    organizations.setdefault(str(member["id"]), str(member.get("name") or member["id"]))
+        version_material = f"{shared_version or 'none'}|{local_version or 'none'}"
+        return {
+            "version": hashlib.sha256(version_material.encode("utf-8")).hexdigest()[:12],
+            "organizations": [{"id": key, "name": value} for key, value in sorted(organizations.items(), key=lambda item: item[1].casefold())],
+            "groups": shared + local,
+        }
+
+    def save_organization_group(self, environment: str, research_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        scope = str(payload.get("scope", "common"))
+        if scope not in {"common", "research"}:
+            raise DataError("企業グループの適用範囲が不正です")
+        target = self._organization_registry_path(environment) if scope == "common" else self._research_organization_path(environment, research_id)
+        existing, _ = self._read_groups(target, scope)
+        action = str(payload.get("action", "save"))
+        group_id = str(payload.get("id") or f"group_{uuid.uuid4().hex[:16]}")
+        if not GROUP_ID.fullmatch(group_id):
+            raise DataError("企業グループIDが不正です")
+        if action == "delete":
+            remaining = [group for group in existing if group.get("id") != group_id]
+            if len(remaining) == len(existing):
+                raise DataError("企業グループが見つかりません")
+            saved = None
+        elif action == "save":
+            name = str(payload.get("name", "")).strip()
+            note = str(payload.get("note", "")).strip()
+            member_ids = list(dict.fromkeys(str(item) for item in payload.get("member_ids", [])))
+            supplied_members = payload.get("members", [])
+            if not name or len(name) > 100:
+                raise DataError("グループ名は1〜100文字で指定してください")
+            if len(note) > 2_000:
+                raise DataError("根拠メモは2000文字以内で指定してください")
+            if len(member_ids) < 2 or any(not ORGANIZATION_ID.fullmatch(item) for item in member_ids):
+                raise DataError("企業グループには2社以上の有効な法人を指定してください")
+            member_names = {
+                str(item.get("id")): str(item.get("name", "")).strip()
+                for item in supplied_members if isinstance(item, dict) and str(item.get("id")) in member_ids
+            }
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            old = next((group for group in existing if group.get("id") == group_id), {})
+            saved = {
+                "id": group_id,
+                "name": name,
+                "member_ids": member_ids,
+                "members": [{"id": item, "name": member_names.get(item, item)} for item in member_ids],
+                "note": note,
+                "verified": bool(payload.get("verified", False)),
+                "created_at": old.get("created_at", now),
+                "updated_at": now,
+            }
+            remaining = [group for group in existing if group.get("id") != group_id] + [saved]
+        else:
+            raise DataError("企業グループ操作が不正です")
+        updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        persisted = [{key: value for key, value in group.items() if key != "scope"} for group in remaining]
+        write_json_atomic(target, {"version": 1, "updated_at": updated_at, "groups": persisted})
+        return {"ok": True, "scope": scope, "group": saved, "path": str(target.relative_to(self.root))}
+
+    def list_researches(self, environment: str, status: str = "active") -> list[dict[str, Any]]:
+        if status not in {"active", "archived", "all"}:
+            raise DataError("リサーチ状態の指定が不正です")
         base = self.paths(environment).researches
         items: list[dict[str, Any]] = []
         if not base.exists():
             return items
         for research_dir in sorted(path for path in base.iterdir() if path.is_dir()):
-            if not ((research_dir / "research.json").exists() or (research_dir / "company_tech.txt").exists() or latest_patent_list(research_dir)[0]):
+            if not (
+                (research_dir / "research.json").exists()
+                or (research_dir / "company_tech.txt").exists()
+                or (research_dir / "patents.json").exists()
+                or latest_patent_list(research_dir)[0]
+            ):
                 continue
             config = read_research_config(research_dir)
+            lifecycle = self._lifecycle(config)
+            if status != "all" and lifecycle["status"] != status:
+                continue
             company_technology = read_company_technology(research_dir, config)
             research_id = safe_id(research_dir.name, "research id")
-            sources, input_audit = research_sources(research_dir, self.paths(environment).pool)
-            subs = [{
-                "id": source["id"], "name": source["name"], "description": source.get("description", ""),
-                "count": len(source["patents"]),
-            } for source in sources]
+            patents, input_audit = research_patents(research_dir, self.paths(environment).pool)
             items.append({
                 "id": research_id,
                 "name": config.get("name", research_id),
                 "description": config.get("description", ""),
                 "company_technology": company_technology,
-                "subresearches": subs,
+                "document_count": len(patents),
                 "input": input_audit,
+                "lifecycle": lifecycle,
+                "csv_history": self._csv_history(research_dir),
             })
         return items
 
@@ -307,54 +722,65 @@ class Repository:
             raise DataError("リサーチが見つかりません")
         config = read_research_config(research_dir)
         company_technology = read_company_technology(research_dir, config)
+        status_rules = legal_status_rules(config)
         patents: list[dict[str, Any]] = []
         seen: set[str] = set()
-        sources, input_audit = research_sources(research_dir, paths.pool)
-        for source in sources:
-            sub_id = source["id"]
-            result_dir = research_dir / "subresearches" / sub_id / "results"
-            for raw in source["patents"]:
-                pdf_name = str(raw.get("pdf", ""))
-                if not pdf_name.lower().endswith(".pdf") or Path(pdf_name).name != pdf_name:
-                    raise DataError(f"不正なPDF参照です: {pdf_name}")
-                pdf_path = (paths.pool / pdf_name).resolve()
-                if pdf_path.parent != paths.pool.resolve():
-                    raise DataError(f"不正なPDF参照です: {pdf_name}")
-                pdf_available = pdf_path.is_file()
-                key = patent_key(pdf_name)
-                if key in seen:
-                    raise DataError(f"同一リサーチ内でPDFが重複しています: {pdf_name}")
-                seen.add(key)
-                analysis_path = result_dir / f"{key}.json"
-                analysis = read_json(analysis_path) if analysis_path.exists() else {}
-                skip_path = research_dir / "subresearches" / sub_id / "pipeline" / key / "skip.json"
-                skip = read_json(skip_path) if skip_path.exists() else {}
-                if not pdf_available:
-                    skip = {"reason": "pdf_not_found", "detail": f"PDFがpatent_poolにありません: {pdf_name}"}
-                publication_number = str(raw.get("publication_number") or Path(pdf_name).stem)
-                record = {
-                    "id": key,
-                    "pdf": pdf_name,
-                    "publication_number": publication_number,
-                    "title": raw.get("title") or publication_number,
-                    "applicant": raw.get("applicant", "未設定"),
-                    "category": raw.get("category", source.get("name", sub_id)),
-                    "subresearch_id": sub_id,
-                    "subresearch_name": source.get("name", sub_id),
-                    "year": raw.get("year") or infer_year(publication_number),
-                    "status": raw.get("status") or infer_status(publication_number),
-                    "tags": raw.get("tags", []),
-                    "pdf_available": pdf_available,
-                    "analysis_state": "skipped" if skip else ("ready" if ANALYSIS_REQUIRED.issubset(analysis) else ("invalid" if analysis else "pending")),
-                    "skip_reason": skip.get("reason"),
-                    "skip_detail": skip.get("detail"),
-                    "source_status": raw.get("source_status"),
-                    "source_ai_score": raw.get("source_ai_score"),
-                    "source_no": raw.get("source_no"),
-                    "pdf_match": raw.get("pdf_match"),
-                }
-                record.update(analysis)
-                patents.append(record)
+        research_documents, input_audit = research_patents(research_dir, paths.pool)
+        for raw in research_documents:
+            pdf_name = str(raw.get("pdf", ""))
+            if not pdf_name.lower().endswith(".pdf") or Path(pdf_name).name != pdf_name:
+                raise DataError(f"不正なPDF参照です: {pdf_name}")
+            pdf_path = (paths.pool / pdf_name).resolve()
+            if pdf_path.parent != paths.pool.resolve():
+                raise DataError(f"不正なPDF参照です: {pdf_name}")
+            pdf_available = pdf_path.is_file()
+            key = patent_key(pdf_name)
+            if key in seen:
+                raise DataError(f"同一リサーチ内でPDFが重複しています: {pdf_name}")
+            seen.add(key)
+            analysis_path = research_dir / "results" / f"{key}.json"
+            legacy_id = raw.get("_legacy_subresearch_id")
+            legacy_analysis_path = research_dir / "subresearches" / str(legacy_id) / "results" / f"{key}.json"
+            if not analysis_path.exists() and legacy_id and legacy_analysis_path.exists():
+                analysis_path = legacy_analysis_path
+            analysis = read_json(analysis_path) if analysis_path.exists() else {}
+            skip_path = research_dir / "pipeline" / key / "skip.json"
+            legacy_skip_path = research_dir / "subresearches" / str(legacy_id) / "pipeline" / key / "skip.json"
+            if not skip_path.exists() and legacy_id and legacy_skip_path.exists():
+                skip_path = legacy_skip_path
+            skip = read_json(skip_path) if skip_path.exists() else {}
+            if not pdf_available:
+                skip = {"reason": "pdf_not_found", "detail": f"PDFがpatent_poolにありません: {pdf_name}"}
+            publication_number = str(raw.get("publication_number") or Path(pdf_name).stem)
+            source_status = raw.get("source_status")
+            derived_application_year = application_year(raw.get("application_date"))
+            record = {
+                "id": key,
+                "pdf": pdf_name,
+                "publication_number": publication_number,
+                "title": raw.get("title") or publication_number,
+                "applicant": raw.get("applicant", "未設定"),
+                "category": raw.get("category", "未分類"),
+                "year": derived_application_year or raw.get("year") or infer_year(publication_number),
+                "year_source": "application_date" if derived_application_year else str(raw.get("year_source") or "legacy"),
+                "status": raw.get("status") or infer_status(publication_number),
+                "legal_status_category": classify_legal_status(source_status, status_rules),
+                "tags": raw.get("tags", []),
+                "pdf_available": pdf_available,
+                "analysis_state": "skipped" if skip else ("ready" if ANALYSIS_REQUIRED.issubset(analysis) else ("invalid" if analysis else "pending")),
+                "skip_reason": skip.get("reason"),
+                "skip_detail": skip.get("detail"),
+                "source_status": source_status,
+                "application_number": raw.get("application_number"),
+                "application_date": raw.get("application_date"),
+                "registration_number": raw.get("registration_number"),
+                "registration_date": raw.get("registration_date"),
+                "source_ai_score": raw.get("source_ai_score"),
+                "source_no": raw.get("source_no"),
+                "pdf_match": raw.get("pdf_match"),
+            }
+            record.update(analysis)
+            patents.append(record)
         technology_map: dict[str, Any] = {}
         clustering_root = research_dir / "clustering"
         if clustering_root.is_dir():
@@ -387,6 +813,7 @@ class Repository:
                     "problem_clusters": cluster_metadata(problem_names, proximity.get("problem", {})),
                 }
                 break
+        organization_registry = self.organization_registry(environment, research_id, patents)
         return {
             "environment": environment,
             "research": {
@@ -394,10 +821,14 @@ class Repository:
                 "name": config.get("name", research_id),
                 "description": config.get("description", ""),
                 "company_technology": company_technology,
+                "legal_status_rules": status_rules,
+                "lifecycle": self._lifecycle(config),
+                "csv_history": self._csv_history(research_dir),
             },
             "pool_count": len(list(paths.pool.glob("*.pdf"))),
             "input": input_audit,
             "technology_map": technology_map,
+            "organization_registry": organization_registry,
             "patents": patents,
         }
 
@@ -479,7 +910,11 @@ class Repository:
         for patent in dashboard["patents"]:
             if not patent.get("pdf_available"):
                 continue
-            artifact_dir = research_dir / "subresearches" / patent["subresearch_id"] / "pipeline" / patent["id"]
+            artifact_dir = research_dir / "pipeline" / patent["id"]
+            if not artifact_dir.exists():
+                legacy_artifacts = list((research_dir / "subresearches").glob(f"*/pipeline/{patent['id']}"))
+                if len(legacy_artifacts) == 1:
+                    artifact_dir = legacy_artifacts[0]
             skip_path = artifact_dir / "skip.json"
             if skip_path.exists():
                 structure_skipped += 1

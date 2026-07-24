@@ -15,7 +15,7 @@ from run_research_pipeline import (
     extraction_index_entry,
     validate_schema_value,
     write_progress_event,
-    write_extraction_indexes,
+    write_extraction_index,
 )
 
 
@@ -57,14 +57,14 @@ class SingleLlmPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             cache = root / "runtime/shared/extractions/hash"
-            artifact = root / "researches/r/subresearches/s/pipeline/JP_A_2026_1"
+            artifact = root / "researches/r/pipeline/JP_A_2026_1"
             cache.mkdir(parents=True)
             artifact.mkdir(parents=True)
             (cache / "extraction_manifest.json").write_text(json.dumps({
                 "pdf_sha256": "hash", "pages": 2, "nonempty_pages": 2, "characters": 123,
                 "extractor": "pypdf", "ocr_used": False,
             }), encoding="utf-8")
-            entry = extraction_index_entry(root, "s", "特開2026-1.pdf", {
+            entry = extraction_index_entry(root, "特開2026-1.pdf", {
                 "cache_dir": cache, "artifact_dir": artifact,
                 "source_decision": {"cache_decision": "reused"},
             })
@@ -77,8 +77,8 @@ class SingleLlmPipelineTests(unittest.TestCase):
                 research_id = "r"
                 environment = "normal"
 
-            paths = write_extraction_indexes(root, Pipeline(), {"s": [entry]})
-            index = json.loads(paths[0].read_text(encoding="utf-8"))
+            path = write_extraction_index(root, Pipeline(), [entry])
+            index = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(index["document_count"], 1)
             self.assertEqual(index["total_pages"], 2)
             self.assertEqual(index["total_characters"], 123)

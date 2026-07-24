@@ -4,7 +4,7 @@
 
 ## 1. 到達点
 
-`patent_pool/` を共有・読み取り専用のPDF格納庫とし、`researches/` 配下の各リサーチにある最新の `patent_list_{yyyymmddHHMMSS}.csv` から対象文献を参照する。CSVがない既存データでは `patents.json` を互換入力とする。ブラウザUIではリサーチ、サブリサーチ、年次、公開・登録状態を切り替え、脅威マップと技術マップへ即時反映し、セルからPDFをプレビューできるようにする。
+`patent_pool/` を共有・読み取り専用のPDF格納庫とし、`researches/` 配下の各リサーチにある最新の `patent_list_{yyyymmddHHMMSS}.csv` から対象文献を参照する。CSVがないデータではリサーチ直下の `patents.json` を入力とする。ブラウザUIではリサーチ、出願年範囲、権利化・審査中・公開状態を切り替え、脅威マップと技術マップへ即時反映し、セルからPDFをプレビューできるようにする。
 
 ローカルLLMはこの工程では実行しない。抽出・分析・Embedding・クラスタリングを差し込めるジョブ契約、プロンプト、JSON保存先までを準備し、実行前診断で不足条件を確認できる状態を完成条件とする。
 
@@ -26,9 +26,9 @@ researches/<research>/
   patent_list_yyyymmddHHMMSS.csv    # 本番の調査対象（CP932）
   company_tech.txt                  # リサーチ固有の自社技術（UTF-8）
   research.json                     # 任意。表示名、説明、パイプライン方針
-  subresearches/<subresearch>/
-    patents.json                    # 文献ID、分類、任意の手動メタデータ
-    results/                        # 通常環境の解析JSON
+  patents.json                      # JSON入力時の文献ID、分類、任意の手動メタデータ
+  pipeline/<patent-id>/             # 文献別の段階成果物
+  results/<patent-id>.json          # UI用の確定結果
 debug_data/
   researches/...                    # DEBUG専用入力fixture
   results/...                       # DEBUG専用解析fixture
@@ -45,7 +45,7 @@ tests/                              # 単体・API・分離・UI契約テスト
 
 1. Python標準ライブラリでlocalhost専用サーバーを作る。
 2. 文献ID正規化、PDF実在確認、重複検査、パストラバーサル拒否を実装する。
-3. リサーチ／サブリサーチ探索と分析JSONマージを実装する。
+3. リサーチ探索、文献入力、分析JSONマージを実装する。
 4. 既存PDFから初期リサーチマニフェストを作る。
 
 完了判定: APIからリサーチ一覧と文献一覧を取得でき、不正PDFパスが拒否される。
@@ -53,7 +53,7 @@ tests/                              # 単体・API・分離・UI契約テスト
 ### Phase 2: PatentViewer UI
 
 1. 添付イメージの濃紺・シアン・角丸カードをデザイントークン化する。
-2. リサーチ、サブリサーチ、年次、法的状態、検索を即時フィルタにする。
+2. リサーチ、出願年の開始・終了、法的状態、検索を即時フィルタにする。
 3. 脅威マップ、技術マップ、件数指標、文献一覧、詳細・解釈パネルを連動する。
 4. PDFを同一画面のモーダルでプレビューし、別タブ表示も提供する。
 5. キーボード操作、フォーカス表示、狭い画面への折返しを実装する。
@@ -69,6 +69,8 @@ tests/                              # 単体・API・分離・UI契約テスト
 5. Codex由来の解釈保存は、実行中の可視コマンドとclient/environment照合を必須にする。
 
 完了判定: Codexコマンドが可視DOMを通って完了し、直接のCodex書込APIは403になる。
+
+追加実装では、リポジトリ同梱stdio MCP、高水準の意味ブロック、dry-run、負荷分類、冪等性、構造化エラー、永続監査、切断検出、ブラウザ再読込復帰、target差分heartbeat、long polling、全Codex更新の可視コマンド認可、ポータブルlauncher/doctorを導入した。既存UIと既存の細粒度Bridge APIは互換経路として維持する。詳細は [CODEX_COLLABORATION.md](CODEX_COLLABORATION.md) を正とする。
 
 ### Phase 4: DEBUG分離とテスト
 
@@ -104,7 +106,7 @@ DEBUGテストスイートを次の順に定義する。
 - サーバーは `127.0.0.1` 以外へ既定でbindしない。
 - `patent_pool/` をアプリが変更しない。
 - NORMAL/DEBUGの入力と出力が画面・API・ファイルパスで一致する。
-- 年次・状態・検索・サブリサーチ変更が両マップ、指標、一覧へ即時反映する。
+- 年次・状態・検索条件の変更が両マップ、指標、一覧へ即時反映する。
 - 文献IDから元PDFを安全に参照し、UI内プレビューできる。
 - pending分析を分析済み件数やスコアに混入させない。
 - Codexは現在の可視targetを発見して操作し、人間が停止できる。

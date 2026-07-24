@@ -23,7 +23,6 @@ from patent_viewer.domain import ANALYSIS_REQUIRED, Repository, patent_key, read
 
 
 DEFAULT_RESEARCH = "debug_llm_single"
-DEFAULT_SUBRESEARCH = "single_document"
 GENERATION_MODEL = "gemma4:e4b"
 EMBEDDING_MODEL = "qwen3-embedding:8b"
 OLLAMA_URL = "http://127.0.0.1:11434"
@@ -135,29 +134,29 @@ def validate_embeddings(response: dict[str, Any], expected_count: int) -> list[l
     return vectors
 
 
-def resolve_target(research_id: str, subresearch_id: str) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+def resolve_target(research_id: str) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     base = ROOT / "debug_data/researches" / research_id
     research = read_json(base / "research.json")
-    manifest_path = base / "subresearches" / subresearch_id / "patents.json"
+    manifest_path = base / "patents.json"
     manifest = read_json(manifest_path)
     patents = manifest.get("patents", [])
     if len(patents) != 1:
         raise RuntimeError("single-document test manifest must contain exactly one patent")
     pdf_path = ROOT / "patent_pool" / patents[0]["pdf"]
     Repository(ROOT).pdf_path(pdf_path.name)
-    return manifest_path.parent, research, patents[0]
+    return base, research, patents[0]
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    sub_dir, research, patent = resolve_target(args.research_id, args.subresearch_id)
+    research_dir, research, patent = resolve_target(args.research_id)
     pdf_path = ROOT / "patent_pool" / patent["pdf"]
     key = patent_key(pdf_path.name)
-    final_path = sub_dir / "results" / f"{key}.json"
+    final_path = research_dir / "results" / f"{key}.json"
     if final_path.exists() and not args.overwrite:
         raise RuntimeError(f"result already exists: {final_path}; use --overwrite explicitly")
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-    run_dir = sub_dir / "runs" / run_id
+    run_dir = research_dir / "runs" / run_id
     started = time.perf_counter()
     text, extraction = extract_pdf(pdf_path)
     atomic_json(run_dir / "extraction.json", extraction)
@@ -208,7 +207,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "status": "completed",
         "environment": "debug",
         "research_id": args.research_id,
-        "subresearch_id": args.subresearch_id,
         "result": str(final_path.relative_to(ROOT)),
         "generation_model": args.generation_model,
         "embedding_model": args.embedding_model,
@@ -227,7 +225,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="DEBUG環境で実PDF 1件をOllama分析する")
     parser.add_argument("--research-id", default=DEFAULT_RESEARCH)
-    parser.add_argument("--subresearch-id", default=DEFAULT_SUBRESEARCH)
     parser.add_argument("--generation-model", default=GENERATION_MODEL)
     parser.add_argument("--embedding-model", default=EMBEDDING_MODEL)
     parser.add_argument("--timeout", type=int, default=900)

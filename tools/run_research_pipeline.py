@@ -103,13 +103,12 @@ def validate_schema_value(value, schema: dict, path: str = "$") -> None:
         raise ValueError(f"{path} is not an allowed value")
 
 
-def extraction_index_entry(root: Path, subresearch_id: str, pdf_name: str, prepared: dict) -> dict:
+def extraction_index_entry(root: Path, pdf_name: str, prepared: dict) -> dict:
     cache_dir = prepared["cache_dir"]
     artifact_dir = prepared["artifact_dir"]
     manifest = json.loads((cache_dir / "extraction_manifest.json").read_text(encoding="utf-8"))
     return {
         "patent_id": patent_key(pdf_name),
-        "subresearch_id": subresearch_id,
         "pdf": pdf_name,
         "pdf_sha256": manifest["pdf_sha256"],
         "pages": manifest["pages"],
@@ -126,22 +125,19 @@ def extraction_index_entry(root: Path, subresearch_id: str, pdf_name: str, prepa
     }
 
 
-def write_extraction_indexes(root: Path, pipeline: ResearchPipeline, entries: dict[str, list[dict]]) -> list[Path]:
-    paths = []
-    for subresearch_id, documents in entries.items():
-        path = pipeline.research_dir / "subresearches" / subresearch_id / "pipeline" / "extraction_index.json"
-        atomic_json(path, {
-            "schema_version": 1,
-            "research_id": pipeline.research_id,
-            "environment": pipeline.environment,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "document_count": len(documents),
-            "total_pages": sum(item["pages"] for item in documents),
-            "total_characters": sum(item["characters"] for item in documents),
-            "documents": documents,
-        })
-        paths.append(path)
-    return paths
+def write_extraction_index(root: Path, pipeline: ResearchPipeline, documents: list[dict]) -> Path:
+    path = pipeline.research_dir / "pipeline" / "extraction_index.json"
+    atomic_json(path, {
+        "schema_version": 1,
+        "research_id": pipeline.research_id,
+        "environment": pipeline.environment,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "document_count": len(documents),
+        "total_pages": sum(item["pages"] for item in documents),
+        "total_characters": sum(item["characters"] for item in documents),
+        "documents": documents,
+    })
+    return path
 
 
 def context_window_for(prompt: str, output_tokens: int = 1200) -> int:
@@ -441,19 +437,17 @@ def main() -> int:
             ollama_url=args.ollama_url, keep_alive=args.keep_alive,
         )
         analyses = {}
-        locations = {}
         company_profile = None
         company_reference = None
         work_items: list[dict] = []
-        extraction_entries: dict[str, list[dict]] = {}
+        extraction_entries: list[dict] = []
         document_failures: list[dict] = []
         document_skips: list[dict] = []
         if args.stage == "plan":
-            for subresearch_id, pdf_path, patent in pipeline.patents():
+            for pdf_path, patent in pipeline.patents():
                 checkpoint()
                 documents.append({
                     "patent_id": patent_key(pdf_path.name),
-                    "subresearch_id": subresearch_id,
                     "pdf": pdf_path.name,
                     "analysis_state": "pending" if pdf_path.is_file() else "skipped",
                     "skip_reason": None if pdf_path.is_file() else "pdf_not_found",
@@ -464,42 +458,40 @@ def main() -> int:
             if args.limit is not None:
                 patents = patents[:args.limit]
             pending_total = sum(
-                not pipeline.result_path(subresearch_id, pdf_path.name).exists() or args.overwrite
-                for subresearch_id, pdf_path, _ in patents
+                not pipeline.existing_result_path(pdf_path.name).exists() or args.overwrite
+                for pdf_path, _ in patents
                 if pdf_path.is_file()
             ) if args.stage == "execute" else len(patents)
             llm_total = sum(
-                (args.overwrite or not pipeline.result_path(subresearch_id, pdf_path.name).exists())
-                and (args.overwrite or not pipeline.analysis_checkpoint_current(subresearch_id, pdf_path.name))
-                for subresearch_id, pdf_path, _ in patents if pdf_path.is_file()
+                (args.overwrite or not pipeline.existing_result_path(pdf_path.name).exists())
+                and (args.overwrite or not pipeline.analysis_checkpoint_current(pdf_path.name))
+                for pdf_path, _ in patents if pdf_path.is_file()
             ) if args.stage == "execute" else 0
             llm_completed = 0
             llm_attempted = 0
             pending_index = 0
             existing_analyses = {}
-            for document_index, (subresearch_id, pdf_path, patent) in enumerate(patents, 1):
+            for document_index, (pdf_path, patent) in enumerate(patents, 1):
                 checkpoint()
                 key = patent_key(pdf_path.name)
-                final_path = pipeline.result_path(subresearch_id, pdf_path.name)
+                final_path = pipeline.existing_result_path(pdf_path.name)
                 if args.stage == "execute" and final_path.exists() and not args.overwrite:
                     if pending_total:
                         if not args.durable_shards:
-                            existing_analyses[key] = pipeline.load_analysis_artifacts(subresearch_id, pdf_path.name)
-                        locations[key] = subresearch_id
+                            existing_analyses[key] = pipeline.load_analysis_artifacts(pdf_path.name)
                     documents.append({
-                        "patent_id": key, "subresearch_id": subresearch_id, "pdf": pdf_path.name,
+                        "patent_id": key, "pdf": pdf_path.name,
                         "analysis_state": "finalized", "skip_reason": "already_processed",
                     })
                     emit("already_processed", patent_id=key, current=pending_index, total=pending_total)
                     continue
                 if args.stage == "execute" and pdf_path.is_file():
                     pending_index += 1
-                    if pipeline.analysis_checkpoint_current(subresearch_id, pdf_path.name) and not args.overwrite:
+                    if pipeline.analysis_checkpoint_current(pdf_path.name) and not args.overwrite:
                         if not args.durable_shards:
-                            analyses[key] = pipeline.load_analysis_artifacts(subresearch_id, pdf_path.name)
-                        locations[key] = subresearch_id
+                            analyses[key] = pipeline.load_analysis_artifacts(pdf_path.name)
                         documents.append({
-                            "patent_id": key, "subresearch_id": subresearch_id, "pdf": pdf_path.name,
+                            "patent_id": key, "pdf": pdf_path.name,
                             "analysis_state": "analyzed", "skip_reason": "analysis_checkpoint_reused",
                         })
                         emit(
@@ -516,21 +508,21 @@ def main() -> int:
                         "reason": "pdf_not_found", "detail": f"PDFがpatent_poolにありません: {pdf_path.name}",
                         "skipped_at": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
                     }
-                    atomic_json(pipeline.artifact_dir(subresearch_id, pdf_path.name) / "skip.json", skip)
-                    documents.append({"patent_id": key, "subresearch_id": subresearch_id, "pdf": pdf_path.name, "analysis_state": "skipped", **skip})
+                    atomic_json(pipeline.artifact_dir(pdf_path.name) / "skip.json", skip)
+                    documents.append({"patent_id": key, "pdf": pdf_path.name, "analysis_state": "skipped", **skip})
                     document_skips.append(skip)
                     emit("skipped", patent_id=key, reason=skip["reason"], current=progress_index, total=pending_total)
                     continue
                 try:
-                    prepared = pipeline.prepare_document(subresearch_id, pdf_path, patent)
+                    prepared = pipeline.prepare_document(pdf_path, patent)
                 except DocumentSkipped as exc:
                     skip = {
                         "schema_version": 1, "patent_id": key, "pdf": pdf_path.name,
                         "reason": exc.reason, "detail": exc.detail,
                         "skipped_at": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
                     }
-                    atomic_json(pipeline.artifact_dir(subresearch_id, pdf_path.name) / "skip.json", skip)
-                    documents.append({"patent_id": key, "subresearch_id": subresearch_id, "pdf": pdf_path.name, "analysis_state": "skipped", **skip})
+                    atomic_json(pipeline.artifact_dir(pdf_path.name) / "skip.json", skip)
+                    documents.append({"patent_id": key, "pdf": pdf_path.name, "analysis_state": "skipped", **skip})
                     document_skips.append(skip)
                     emit("skipped", patent_id=key, reason=exc.reason, current=progress_index, total=pending_total)
                     continue
@@ -552,9 +544,9 @@ def main() -> int:
                         "failed_at": datetime.now(timezone.utc).isoformat(),
                         "retry_on_next_run": True,
                     }
-                    atomic_json(pipeline.artifact_dir(subresearch_id, pdf_path.name) / "analysis_error.json", failure)
+                    atomic_json(pipeline.artifact_dir(pdf_path.name) / "analysis_error.json", failure)
                     documents.append({
-                        "patent_id": key, "subresearch_id": subresearch_id, "pdf": pdf_path.name,
+                        "patent_id": key, "pdf": pdf_path.name,
                         "analysis_state": "failed", "analysis_error": failure,
                     })
                     document_failures.append(failure)
@@ -569,7 +561,6 @@ def main() -> int:
                     skip_path.unlink()
                 document_record = {
                     "patent_id": key,
-                    "subresearch_id": subresearch_id,
                     "pdf": pdf_path.name,
                     "artifact_dir": str(prepared["artifact_dir"].relative_to(ROOT)),
                     "source_decision": prepared["source_decision"],
@@ -577,18 +568,16 @@ def main() -> int:
                     "analysis_state": "ready" if args.stage == "execute" else "prepared",
                 }
                 documents.append(document_record)
-                extraction_entries.setdefault(subresearch_id, []).append(
-                    extraction_index_entry(ROOT, subresearch_id, pdf_path.name, prepared)
-                )
+                extraction_entries.append(extraction_index_entry(ROOT, pdf_path.name, prepared))
                 if args.stage == "execute":
                     work_items.append({
-                        "key": key, "subresearch_id": subresearch_id, "pdf_path": pdf_path,
+                        "key": key, "pdf_path": pdf_path,
                         "prepared": None if args.durable_shards else prepared,
                         "record": document_record, "index": progress_index,
                         "audit_dir": prepared["artifact_dir"] / "attempts" / run_id,
                     })
 
-        if args.stage == "execute" and (work_items or analyses or (args.durable_shards and locations)):
+        if args.stage == "execute" and (work_items or analyses):
             emit("company_profile", current=0, total=pending_total)
             model.audit_dir = pipeline.research_dir / "clustering" / run_id / "company_profile"
             company_profile = model.generate_json("company_profile", {
@@ -608,7 +597,7 @@ def main() -> int:
                 checkpoint()
                 if args.durable_shards:
                     for item in shard_items:
-                        item["prepared"] = pipeline.load_prepared_document(item["subresearch_id"], item["pdf_path"].name)
+                        item["prepared"] = pipeline.load_prepared_document(item["pdf_path"].name)
                     emit(
                         "shard_started", shard=shard_index, shards=len(shards),
                         batch_size=len(shard_items), current=llm_completed, total=pending_total,
@@ -729,7 +718,6 @@ def main() -> int:
                 for item in shard_items:
                     if item["key"] not in shard_analyses:
                         continue
-                    locations[item["key"]] = item["subresearch_id"]
                     llm_completed += 1
                     error_path = item["prepared"]["artifact_dir"] / "analysis_error.json"
                     if error_path.exists():
@@ -781,10 +769,10 @@ def main() -> int:
             company_inputs = [company_profile["technology_summary"], company_profile["problem_summary"]]
             company_reference = pipeline.build_company_reference(company_profile, model.embed(company_inputs))
             model.unload_embedding()
-        extraction_indexes = write_extraction_indexes(ROOT, pipeline, extraction_entries) if extraction_entries else []
+        extraction_indexes = [write_extraction_index(ROOT, pipeline, extraction_entries)] if extraction_entries else []
         finalized = None
         if args.stage == "execute":
-            should_finalize = bool(analyses or existing_analyses or (args.durable_shards and locations))
+            should_finalize = bool(analyses or existing_analyses or (args.durable_shards and patents))
             if should_finalize:
                 checkpoint()
                 processed_count = llm_completed
@@ -795,16 +783,15 @@ def main() -> int:
                         "loading_embeddings", documents=len(patents), processed=processed_count,
                         current=pending_total, total=pending_total, percent=100,
                     )
-                    for subresearch_id, pdf_path, _ in patents:
+                    for pdf_path, _ in patents:
                         key = patent_key(pdf_path.name)
                         if key in failed_keys:
                             continue
                         if (
-                            pipeline.analysis_checkpoint_current(subresearch_id, pdf_path.name)
-                            or pipeline.result_path(subresearch_id, pdf_path.name).exists()
+                            pipeline.analysis_checkpoint_current(pdf_path.name)
+                            or pipeline.existing_result_path(pdf_path.name).exists()
                         ):
-                            analyses[key] = pipeline.load_analysis_artifacts(subresearch_id, pdf_path.name)
-                            locations[key] = subresearch_id
+                            analyses[key] = pipeline.load_analysis_artifacts(pdf_path.name)
                 else:
                     analyses = {**existing_analyses, **analyses}
                 progress_context.clear()
@@ -817,13 +804,14 @@ def main() -> int:
                 model.audit_dir = pipeline.research_dir / "clustering" / run_id
                 model.counter = 0
                 finalized = pipeline.finalize_research(
-                    analyses, locations, model.generate_json, run_id, args.cluster_count, company_reference,
+                    analyses, model.generate_json, run_id, args.cluster_count, company_reference,
                     lambda stage, **detail: emit(
                         stage, **progress_context, **detail,
                     ),
                 )
                 finalized["processed"] = processed_count
                 finalized["failed"] = len(document_failures)
+                pipeline.mark_analysis_current()
                 finalized["failed_documents"] = [item["patent_id"] for item in document_failures]
             else:
                 finalized = {

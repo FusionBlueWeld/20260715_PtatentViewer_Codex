@@ -5,13 +5,14 @@
 ## 現在できること
 
 - `researches/<research>/patent_list_{yyyymmddHHMMSS}.csv` のCP932直接取込（最新1件）
-- CSVがない既存リサーチは `subresearches/<subresearch>/patents.json` を互換入力として使用
-- リサーチ／サブリサーチ／年次／公開・登録／検索のリアルタイム絞り込み
+- CSVがないリサーチは直下の `patents.json` を入力として使用（旧サブリサーチ形式も読込互換）
+- リサーチ／出願年範囲／権利化・審査中・公開／検索のリアルタイム絞り込み
 - 脅威マップと技術マップ、セル連動文献一覧
 - `patent_pool/` のPDFをUI内または別タブでプレビュー
 - 文献ごとの分析要約、評価根拠、解釈メモ保存
 - NORMAL/DEBUGの入力・成果物・監査保存先分離
 - Codexが可視DOMを操作するUI Bridge（発見、意図、進捗、pause/resume/cancel、監査）
+- リポジトリ同梱MCP、ルールベース文献検索、高水準UIブロック、dry-run、冪等実行、永続監査
 - モデル推論を実行しないLLM preflight
 
 ## 起動
@@ -37,6 +38,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start.ps1 -IdleTimeoutMinutes
 
 ブラウザで `http://127.0.0.1:8765` を開きます。サーバーは既定でlocalhostにだけbindします。
 
+OSに依存しない起動とCodex協働設定には、Pythonランチャーも使用できます。
+
+```powershell
+python tools/patent_viewer.py start
+python tools/patent_viewer.py mcp-config --write
+python tools/patent_viewer.py doctor
+```
+
+別デバイスではclone後に同じ3コマンドを実行します。デバイス固有のPythonパスとMCP設定は `.codex/mcp.local.json`、実行ごとの接続トークンは `runtime/server-control.json` に生成され、Gitには保存されません。UIだけを軽く使用する場合は `start --no-managed-ollama` を指定できます。詳細は [Codex collaboration設計](docs/CODEX_COLLABORATION.md) を参照してください。
+
 ローカルLLM検証を含むPython依存パッケージは次で導入できます。
 
 ```powershell
@@ -49,10 +60,12 @@ python -m pip install -r requirements.txt
 powershell -ExecutionPolicy Bypass -File .\scripts\debug.ps1
 ```
 
-このコマンドはunit、API、NORMAL/DEBUG分離、Bridgeプロトコル契約、実データマニフェストを検査します。その後UIをDEBUGへ切り替え、次を実ブラウザで確認します。
+このコマンドはunit、API、NORMAL/DEBUG分離、Bridgeプロトコル契約、実データマニフェスト、wide/narrow画像回帰、可視ブラウザの全Semantic Block smokeを検査します。可視ブラウザが接続されていない場合は成功扱いにせず停止します。ブラウザ確認だけを明示的に省略する場合は `python tools/debug_check.py --allow-browser-skip` を使用します。
+
+画像基準を意図的なUI変更に合わせて更新する場合だけ、`python tools/ui_visual_check.py --update-baselines` を実行してください。通常実行は `tests/visual_baselines/` と比較し、終了時に対象ブラウザを元のNORMAL/DEBUG環境へ戻します。複数ブラウザが接続されている場合、`tools/browser_smoke.py --client-id <id>` で対象を明示します。
 
 1. `DEBUG: レーザー加工デモ` が表示される。
-2. 年次、公開・登録、サブリサーチで件数と両マップが即時変わる。
+2. 出願年の開始・終了、権利化・審査中・公開、検索条件で件数と両マップが即時変わる。
 3. マップセルから文献を選び、PDFモーダルを開ける。
 4. Codex collaborationパネルが表示され、可視targetが `/api/ui/clients` に現れる。
 5. テスト終了時にNORMALへ戻す。
@@ -81,7 +94,7 @@ PDF選択、小型プロンプト5件、小型JSON Schema 5件、出力分離、
 
 成果物:
 
-- UI用結果: `debug_data/researches/debug_llm_single/subresearches/single_document/results/<patent-id>.json`
+- UI用結果: `debug_data/researches/debug_llm_single/results/<patent-id>.json`
 - 実行監査: 同フォルダ階層の `runs/<run-id>/run_manifest.json`
 - 抽出情報・テキスト・プロンプト・生成応答・Embedding応答: 同じrunフォルダ
 
@@ -109,15 +122,19 @@ PDFテキスト抽出と章・請求項構造化だけを先に行う場合は�
 
 ## リサーチ追加
 
-1. `researches/<research-id>/` を作る。表示名や個別パイプライン設定が必要な場合だけ `research.json` を置く。
-2. リサーチ直下に `patent_list_{yyyymmddHHMMSS}.csv` と `company_tech.txt` を置く。CSVが複数ある場合はファイル名の最新タイムスタンプ1件だけを使う。
-3. 分析結果は `subresearches/patent_list/results/<正規化文献ID>.json` へ自動保存される。
+画面の `リサーチ管理` から、名前、ID、説明、自社技術、`patent_list_{yyyymmddHHMMSS}.csv` を登録する。CSVはCP932・既定11列を事前検証し、PDF一致・未発見・複数候補・警告件数を表示してから保存する。
+
+同じリサーチへCSVを追加した場合、ファイル名のタイムスタンプが最新の1件だけを採用し、旧CSVは履歴として保持する。最新版が切り替わると分析状態は「再分析必要」となり、夜間一括分析で全件再分析を完了するまで解除されない。夜間一括分析画面では使用中リサーチを選択できる。
+
+リサーチ管理からアーカイブすると通常一覧と夜間分析対象から外れるが、CSV、分析結果、実行履歴は保持される。復元すると再び使用できる。
+
+分析結果は `results/<正規化文献ID>.json`、段階成果物は `pipeline/<正規化文献ID>/` へ自動保存される。
 
 PDFそのものをリサーチフォルダへ複製しないことが重要です。
 
 本番リサーチフォルダに格納される `patent_list_{yyyymmddHHMMSS}.csv` の列仕様と現行の取込動作は [docs/PATENT_LIST_CSV_SPEC.md](docs/PATENT_LIST_CSV_SPEC.md) に記録しています。
 
-PDFファイル名は従来の `JPA ...` / `JPB ...` に加え、`WO20xx-XXXXXX`、`特開20xx-XXXXXX`、`特表20xx-XXXXXX`、`特許第XXXXXXX号`、`特開平x-XXXXXX`、`特表平x-XXXXXX` を使用できます。全角数字と一般的なハイフン表記も正規化します。平成表記は年次フィルタ用に西暦へ変換し、登録特許のファイル名だけでは年次を確定できないため、必要な場合は `patents.json` の `year` に明示してください。
+PDFファイル名は従来の `JPA ...` / `JPB ...` に加え、`WO20xx-XXXXXX`、`特開20xx-XXXXXX`、`特表20xx-XXXXXX`、`特許第XXXXXXX号`、`特開平x-XXXXXX`、`特表平x-XXXXXX` を使用できます。全角数字と一般的なハイフン表記も正規化します。CSV入力の年次フィルタは「出願日」の年を使用し、CSVを使わない互換データでは `patents.json` の `year` または公報番号からの推定値を使用します。
 
 ## Git管理するデータの境界
 

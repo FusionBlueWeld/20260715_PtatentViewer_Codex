@@ -15,12 +15,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .collaboration import (
+    ACTION_TYPES, PROTOCOL_VERSION, AuditStore, BlockPlanner, CollaborationError,
+    estimate_workload, target_snapshot_hash, validate_actions,
+)
 from .domain import DataError, Repository
 from .ollama_runtime import ManagedOllama, adaptive_runtime_config, detect_nvidia_gpu, detect_system_memory_mib
 from .pipeline import ResearchPipeline, atomic_json
 
 
-PROTOCOL_ACTIONS = ("click", "input", "check", "keydown", "select", "wait", "assert")
+PROTOCOL_ACTIONS = ACTION_TYPES
 TERMINAL = {"completed", "failed", "cancelled"}
 
 
@@ -37,6 +41,8 @@ class AppState:
         self.commands: dict[str, dict] = {}
         self.pipeline_jobs: dict[str, dict] = {}
         self.activity: list[dict] = []
+        self.block_planner = BlockPlanner(self.root / "schemas" / "collaboration-blocks.json")
+        self.audit = AuditStore(self.root / "runtime")
         self.lock = threading.RLock()
         self.server = None
         self.runtime_config = adaptive_runtime_config(
@@ -174,6 +180,8 @@ class AppState:
         item = {"at": time.time(), "event": event, **detail}
         self.activity.append(item)
         self.activity[:] = self.activity[-300:]
+        if event.startswith(("command_", "collaboration_")):
+            self.audit.append(event, **detail)
 
     def touch(self, source: str) -> None:
         with self.lock:
@@ -224,7 +232,7 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
 
     def _body(self):
         length = int(self.headers.get("Content-Length", "0"))
-        if length > 1_000_000:
+        if length > 7_000_000:
             raise DataError("リクエストが大きすぎます")
         try:
             return json.loads(self.rfile.read(length) or b"{}")
@@ -247,6 +255,8 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             self._get()
+        except CollaborationError as exc:
+            self._json(HTTPStatus.CONFLICT if exc.retryable else HTTPStatus.BAD_REQUEST, exc.payload())
         except (DataError, OSError) as exc:
             self._error(exc)
 
@@ -266,10 +276,11 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
         if path not in {"/api/ui/next"}:
             self.state.touch(f"GET {path}")
         if path == "/api/environment":
-            return self._json(200, {"environment": self.state.environment})
+            return self._json(200, {"environment": self._request_environment()})
         if path == "/api/researches":
             env = query.get("environment", [self.state.environment])[0]
-            return self._json(200, {"environment": env, "items": self.state.repo.list_researches(env)})
+            status = query.get("status", ["active"])[0]
+            return self._json(200, {"environment": env, "status": status, "items": self.state.repo.list_researches(env, status)})
         if path.startswith("/api/researches/") and path.endswith("/dashboard"):
             research_id = path.split("/")[3]
             env = query.get("environment", [self.state.environment])[0]
@@ -291,14 +302,25 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
             pdf_name = path.removeprefix("/api/pdfs/")
             return self._file(self.state.repo.pdf_path(pdf_name), "application/pdf")
         if path == "/api/ui-protocol":
-            return self._json(200, {"version": 2, "actions": PROTOCOL_ACTIONS, "max_actions": 100, "same_visible_dom": True, "capabilities": ["research-pipeline", "pipeline-control"], "pipeline_controls": ["run", "pause", "cancel"]})
+            return self._json(200, {"version": PROTOCOL_VERSION, "actions": PROTOCOL_ACTIONS, "max_actions": 100, "same_visible_dom": True, "capabilities": ["research-pipeline", "pipeline-control", "semantic-blocks", "dry-run", "idempotency", "persistent-audit"], "pipeline_controls": ["run", "pause", "cancel"]})
+        if path == "/api/collaboration/status":
+            return self._json(200, self._collaboration_status())
+        if path == "/api/collaboration/blocks":
+            return self._json(200, {"protocol_version": PROTOCOL_VERSION, "items": self.state.block_planner.list_blocks()})
+        if path == "/api/collaboration/audit":
+            limit = int(query.get("limit", ["100"])[0])
+            return self._json(200, {"items": self.state.audit.recent(limit)})
         if path == "/api/ui/clients":
             now = time.time()
             with self.state.lock:
                 items = [c for c in self.state.clients.values() if now - c["heartbeat_at"] < 20]
             return self._json(200, {"items": items})
         if path == "/api/ui/next":
-            return self._claim_next(query.get("clientId", [""])[0])
+            try:
+                wait_seconds = max(0.0, min(float(query.get("wait", ["0"])[0]), 15.0))
+            except ValueError:
+                wait_seconds = 0.0
+            return self._claim_next(query.get("clientId", [""])[0], wait_seconds)
         if path.startswith("/api/ui/commands/") and path.endswith("/control"):
             command = self._command(path.split("/")[4])
             return self._json(200, {"command_id": command["id"], "control": command["control"]})
@@ -321,6 +343,8 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             self._post()
+        except CollaborationError as exc:
+            self._json(HTTPStatus.CONFLICT if exc.retryable else HTTPStatus.BAD_REQUEST, exc.payload())
         except (DataError, OSError) as exc:
             self._error(exc)
 
@@ -329,32 +353,107 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
         body = self._body()
         if path == "/api/admin/shutdown":
             return self._shutdown()
+        if (
+            body.get("source") == "codex"
+            and not path.startswith("/api/ui/")
+            and path != "/api/collaboration/execute"
+            and not self._authorized_codex(body.get("environment", self.state.environment))
+        ):
+            return self._json(403, {
+                "error": "Codexの更新は実行中の可視UIコマンドが必要です",
+                "code": "VISIBLE_UI_COMMAND_REQUIRED", "retryable": False,
+            })
         if path != "/api/ui/clients/heartbeat":
             self.state.touch(f"POST {path}")
         if path == "/api/environment":
             env = body.get("environment")
             self.state.repo.paths(env)
-            self.state.environment = env
-            self.state.log("environment_changed", environment=env)
-            return self._json(200, {"environment": env, "reload_required": True})
+            client_id = self.headers.get("X-PatentViewer-UI-Client", "")
+            with self.state.lock:
+                client = self.state.clients.get(client_id)
+                if client:
+                    client["environment"] = env
+                else:
+                    self.state.environment = env
+            self.state.log("environment_changed", environment=env, client_id=client_id or None)
+            return self._json(200, {"environment": env, "reload_required": True, "client_scoped": bool(client)})
+        if path == "/api/collaboration/plan":
+            plan = self.state.block_planner.plan(str(body.get("block", "")), body.get("arguments"))
+            count = int(body.get("document_count", 0) or 0)
+            plan["workload"] = estimate_workload(plan["block"], count, bool(body.get("cached")))
+            return self._json(200, plan)
+        if path == "/api/collaboration/execute":
+            return self._execute_block(body)
+        if path == "/api/researches/validate-csv":
+            env = body.get("environment", self.state.environment)
+            return self._json(200, self.state.repo.validate_research_csv(
+                env, str(body.get("csv_filename", "")), str(body.get("csv_base64", "")),
+            ))
+        if path == "/api/researches":
+            env = body.get("environment", self.state.environment)
+            result = self.state.repo.create_research(env, body)
+            self.state.log("research_created", environment=env, research_id=result["research_id"])
+            return self._json(201, result)
+        if path.startswith("/api/researches/") and path.endswith("/csvs"):
+            env = body.get("environment", self.state.environment)
+            research_id = path.split("/")[3]
+            result = self.state.repo.add_research_csv(env, research_id, body)
+            self.state.log(
+                "research_csv_uploaded", environment=env, research_id=research_id,
+                active_changed=result["active_changed"], active_csv=result["active_csv"],
+            )
+            return self._json(201, result)
+        if path.startswith("/api/researches/") and (path.endswith("/archive") or path.endswith("/restore")):
+            env = body.get("environment", self.state.environment)
+            research_id = path.split("/")[3]
+            archived = path.endswith("/archive")
+            active = [
+                self.state.pipeline_job(job_id) for job_id, job in self.state.pipeline_jobs.items()
+                if job["environment"] == env and job["research_id"] == research_id
+                and self.state.pipeline_job(job_id)["status"] in {"running", "paused", "cancelling"}
+            ]
+            if active:
+                raise DataError("実行中の夜間一括分析があるためアーカイブ状態を変更できません")
+            result = self.state.repo.set_research_archived(env, research_id, archived, str(body.get("reason", "")))
+            self.state.log("research_archived" if archived else "research_restored", environment=env, research_id=research_id)
+            return self._json(200, result)
+        if path.startswith("/api/researches/") and path.endswith("/legal-status-rules"):
+            env = body.get("environment", self.state.environment)
+            if env != self._request_environment():
+                return self._json(409, {"error": "画面とサーバーの環境が一致しません"})
+            research_id = path.split("/")[3]
+            result = self.state.repo.save_legal_status_rules(env, research_id, body)
+            self.state.log("legal_status_rules_saved", environment=env, research_id=research_id)
+            return self._json(200, result)
         if path == "/api/interpretations":
             env = body.get("environment", self.state.environment)
-            if env != self.state.environment:
+            if env != self._request_environment():
                 return self._json(409, {"error": "画面とサーバーの環境が一致しません"})
             if body.get("source") == "codex" and not self._authorized_codex(env):
                 return self._json(403, {"error": "Codexの保存は実行中の可視UIコマンドが必要です"})
             target = self.state.repo.save_interpretation(env, body)
             self.state.log("interpretation_saved", environment=env, patent_id=body.get("patent_id"))
             return self._json(201, {"ok": True, "path": str(target.relative_to(self.state.root))})
+        if path.startswith("/api/researches/") and path.endswith("/organization-groups"):
+            env = body.get("environment", self.state.environment)
+            if env != self._request_environment():
+                return self._json(409, {"error": "画面とサーバーの環境が一致しません"})
+            research_id = path.split("/")[3]
+            result = self.state.repo.save_organization_group(env, research_id, body)
+            self.state.log("organization_group_saved", environment=env, research_id=research_id, scope=result["scope"])
+            return self._json(200 if body.get("action") == "delete" else 201, result)
         if path.startswith("/api/researches/") and path.endswith("/pipeline/jobs"):
             env = body.get("environment", self.state.environment)
-            if env != self.state.environment:
+            if env != self._request_environment():
                 return self._json(409, {"error": "画面とサーバーの環境が一致しません"})
             research_id = path.split("/")[3]
             mode = body.get("mode")
             if body.get("source") == "codex" and not self._authorized_codex(env):
                 return self._json(403, {"error": "Codexのpipeline実行は実行中の可視UIコマンドが必要です"})
             if mode == "execute":
+                overview = ResearchPipeline(self.state.root, env, research_id).overview()
+                if overview.get("analysis_stale") and not body.get("overwrite"):
+                    raise DataError("最新版CSVへの切替後は全件再分析を選択してください")
                 if body.get("confirmation") != "RUN_LOCAL_LLM":
                     raise DataError("ローカルLLM実行の明示確認が必要です")
                 preflight = self.state.preflight(env, research_id)
@@ -392,20 +491,125 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
             if self.state.last_user_event_at < user_active_at <= now + 5:
                 self.state.last_user_event_at = user_active_at
                 self.state.touch("browser_user_event")
+        snapshot_hash = str(body.get("targetSnapshotHash", ""))[:64] or target_snapshot_hash(targets)
+        prior = self.state.clients.get(client_id, {})
+        if not targets and snapshot_hash == prior.get("targetSnapshotHash"):
+            targets = prior.get("targets", [])
+        requested_environment = str(prior.get("environment", body.get("environment", self.state.environment)))
+        if requested_environment not in {"normal", "debug"}:
+            requested_environment = self.state.environment
         client = {
             "clientId": client_id,
             "url": str(body.get("url", ""))[:500],
             "title": str(body.get("title", ""))[:200],
             "module": str(body.get("module", "patent-viewer"))[:100],
-            "environment": self.state.environment,
+            "environment": requested_environment,
             "capabilities": body.get("capabilities", []),
             "targets": targets,
+            "targetSnapshotHash": snapshot_hash,
             "currentCommandId": body.get("currentCommandId"),
             "heartbeat_at": time.time(),
         }
         with self.state.lock:
             self.state.clients[client_id] = client
-        return self._json(200, {"ok": True, "environment": self.state.environment})
+        return self._json(200, {"ok": True, "environment": requested_environment})
+
+    def _request_environment(self) -> str:
+        client_id = self.headers.get("X-PatentViewer-UI-Client", "")
+        with self.state.lock:
+            client = self.state.clients.get(client_id)
+            if client and time.time() - client["heartbeat_at"] < 20:
+                return str(client.get("environment", self.state.environment))
+        return self.state.environment
+
+    def _collaboration_status(self):
+        now = time.time()
+        with self.state.lock:
+            for command in self.state.commands.values():
+                if command["status"] == "queued" and now - command["created_at"] > 300:
+                    command["status"] = "failed"
+                    command["events"].append({"type": "failed", "code": "COMMAND_EXPIRED", "at": now})
+                    self.state.log("command_expired", command_id=command["id"], reason="queue_timeout")
+                elif command["status"] == "running":
+                    client = self.state.clients.get(str(command.get("claimedBy", "")))
+                    if not client or now - client["heartbeat_at"] >= 20:
+                        command["status"] = "failed"
+                        command["events"].append({"type": "failed", "code": "CLIENT_DISCONNECTED", "at": now})
+                        self.state.log("command_expired", command_id=command["id"], reason="client_disconnected")
+            clients = [
+                {
+                    "clientId": client["clientId"],
+                    "url": client["url"],
+                    "module": client["module"],
+                    "environment": client["environment"],
+                    "capabilities": client["capabilities"],
+                    "target_count": len(client["targets"]),
+                    "target_snapshot_hash": client.get("targetSnapshotHash", ""),
+                    "currentCommandId": client.get("currentCommandId"),
+                    "age_seconds": round(now - client["heartbeat_at"], 3),
+                }
+                for client in self.state.clients.values()
+                if now - client["heartbeat_at"] < 20
+            ]
+            active = [
+                {"id": command["id"], "intent": command["intent"], "status": command["status"], "block": command.get("block")}
+                for command in self.state.commands.values()
+                if command["status"] not in TERMINAL
+            ]
+        return {
+            "ok": True,
+            "protocol_version": PROTOCOL_VERSION,
+            "environment": self.state.environment,
+            "environment_scope": "per-client",
+            "clients": clients,
+            "active_commands": active,
+            "blocks": len(self.state.block_planner.list_blocks()),
+            "portable": {"repo_relative": True, "transport": "localhost-http", "codex_adapter": "stdio-mcp"},
+        }
+
+    def _collaboration_authorized(self) -> bool:
+        supplied = self.headers.get("X-PatentViewer-Collaboration-Token", "")
+        return bool(self.state.control_token and supplied and hmac.compare_digest(supplied, self.state.control_token))
+
+    def _execute_block(self, body):
+        plan = self.state.block_planner.plan(str(body.get("block", "")), body.get("arguments"))
+        plan["workload"] = estimate_workload(plan["block"], int(body.get("document_count", 0) or 0), bool(body.get("cached")))
+        if body.get("dry_run", False):
+            self.state.log("collaboration_plan", block=plan["block"], workload=plan["workload"])
+            return self._json(200, plan)
+        if not self._collaboration_authorized():
+            return self._json(403, {"error": "collaboration authorization failed", "code": "UNAUTHORIZED", "retryable": False})
+        client_id = str(body.get("targetClientId", ""))
+        if not client_id:
+            now = time.time()
+            available = [
+                client for client in self.state.clients.values()
+                if now - client["heartbeat_at"] < 20 and client["module"] == "patent-viewer"
+            ]
+            if len(available) != 1:
+                raise CollaborationError(
+                    "CLIENT_SELECTION_REQUIRED", "対象ブラウザを一意に選べません",
+                    retryable=True, detail={"available_clients": [item["clientId"] for item in available]},
+                )
+            client_id = available[0]["clientId"]
+        key = str(body.get("idempotency_key", "")).strip()
+        if key:
+            prior = self.state.audit.find_idempotent(key)
+            if prior:
+                command = self.state.commands.get(str(prior.get("command_id", "")))
+                return self._json(200, {"reused": True, "command": command or prior})
+        definition = plan["definition"]
+        command_body = {
+            "actor": "codex",
+            "intent": str(body.get("intent") or definition["description"]),
+            "targetClientId": client_id,
+            "actions": plan["actions"],
+            "block": plan["block"],
+            "blockArguments": plan["arguments"],
+            "idempotencyKey": key or None,
+            "workload": plan["workload"],
+        }
+        return self._create_command(command_body)
 
     def _shutdown(self):
         supplied = self.headers.get("X-PatentViewer-Control-Token", "")
@@ -419,26 +623,34 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
     def _create_command(self, body):
         actor = body.get("actor", "codex")
         client_id = body.get("targetClientId")
-        actions = body.get("actions")
+        actions = validate_actions(body.get("actions"))
         if actor != "codex" or not str(body.get("intent", "")).strip():
             raise DataError("actor=codexとintentが必要です")
-        if not isinstance(actions, list) or not 1 <= len(actions) <= 100:
-            raise DataError("actionsは1〜100件です")
-        if any(a.get("type") not in PROTOCOL_ACTIONS for a in actions):
-            raise DataError("未対応のactionがあります")
         with self.state.lock:
             client = self.state.clients.get(client_id)
             if not client or time.time() - client["heartbeat_at"] >= 20:
-                raise DataError("対象clientが見つかりません")
+                raise CollaborationError("CLIENT_NOT_CONNECTED", "対象clientが見つかりません", retryable=True)
+            block = body.get("block")
+            if block:
+                definition = self.state.block_planner.catalog.get(str(block))
+                if definition and definition.capability not in client.get("capabilities", []):
+                    raise CollaborationError(
+                        "CAPABILITY_NOT_AVAILABLE", f"clientは{definition.capability}に対応していません",
+                        detail={"capability": definition.capability},
+                    )
             command_id = uuid.uuid4().hex
             command = {
                 "id": command_id,
                 "actor": actor,
                 "intent": str(body["intent"])[:500],
                 "targetClientId": client_id,
-                "environment": self.state.environment,
+                "environment": client["environment"],
                 "module": client["module"],
                 "actions": actions,
+                "block": body.get("block"),
+                "blockArguments": body.get("blockArguments", {}),
+                "idempotencyKey": body.get("idempotencyKey"),
+                "workload": body.get("workload"),
                 "status": "queued",
                 "control": "run",
                 "claimedBy": None,
@@ -447,24 +659,33 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
             }
             self.state.commands[command_id] = command
             self.state.log("command_queued", command_id=command_id, intent=command["intent"])
+            self.state.audit.append(
+                "command_created", command_id=command_id, intent=command["intent"], block=command.get("block"),
+                idempotency_key=command.get("idempotencyKey"), target_client_id=client_id,
+                environment=command["environment"], actions=len(actions), workload=command.get("workload"),
+            )
         return self._json(201, command)
 
-    def _claim_next(self, client_id):
-        with self.state.lock:
-            client = self.state.clients.get(client_id)
-            if not client or time.time() - client["heartbeat_at"] >= 20:
-                raise DataError("clientが見つかりません")
-            for command in self.state.commands.values():
-                if command["status"] == "queued" and command["targetClientId"] == client_id:
-                    if command["environment"] != self.state.environment:
-                        command["status"] = "failed"
-                        command["events"].append({"type": "failed", "error": "environment changed", "at": time.time()})
-                        continue
-                    command["status"] = "running"
-                    command["claimedBy"] = client_id
-                    self.state.log("command_claimed", command_id=command["id"], client_id=client_id)
-                    return self._json(200, {"command": command})
-        return self._json(200, {"command": None})
+    def _claim_next(self, client_id, wait_seconds=0.0):
+        deadline = time.time() + wait_seconds
+        while True:
+            with self.state.lock:
+                client = self.state.clients.get(client_id)
+                if not client or time.time() - client["heartbeat_at"] >= 20:
+                    raise DataError("clientが見つかりません")
+                for command in self.state.commands.values():
+                    if command["status"] == "queued" and command["targetClientId"] == client_id:
+                        if command["environment"] != client["environment"]:
+                            command["status"] = "failed"
+                            command["events"].append({"type": "failed", "error": "environment changed", "at": time.time()})
+                            continue
+                        command["status"] = "running"
+                        command["claimedBy"] = client_id
+                        self.state.log("command_claimed", command_id=command["id"], client_id=client_id)
+                        return self._json(200, {"command": command})
+            if time.time() >= deadline:
+                return self._json(200, {"command": None})
+            time.sleep(0.1)
 
     def _command(self, command_id):
         with self.state.lock:
@@ -514,7 +735,7 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
                 and command["actor"] == "codex"
                 and command["status"] == "running"
                 and command["claimedBy"] == client_id
-                and command["environment"] == environment == self.state.environment
+                and command["environment"] == environment == client.get("environment")
                 and command["module"] == client["module"] == "patent-viewer"
                 and time.time() - client["heartbeat_at"] < 20
             )
@@ -542,6 +763,7 @@ def main():
     parser.add_argument("--control-file", type=Path)
     parser.add_argument("--generation-workers", type=int, help="override automatic VRAM-derived generation concurrency")
     parser.add_argument("--embedding-batch-size", type=int, help="override automatic embedding input batch size")
+    parser.add_argument("--no-managed-ollama", action="store_true", help="do not start a dedicated Ollama process")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
     if args.generation_workers is not None and not 1 <= args.generation_workers <= 8:
@@ -553,7 +775,7 @@ def main():
     control_token = uuid.uuid4().hex
     server = create_server(
         args.root, args.host, args.port, quiet=args.quiet, idle_timeout=args.idle_timeout,
-        control_token=control_token, manage_ollama=True,
+        control_token=control_token, manage_ollama=not args.no_managed_ollama,
         generation_workers=args.generation_workers, embedding_batch_size=args.embedding_batch_size,
     )
     control_file = (args.control_file or (args.root / "runtime/server-control.json")).resolve()

@@ -32,22 +32,36 @@
         <p class="eyebrow">RESEARCH SCOPE</p>
         <label for="research-select">リサーチ</label>
         <select id="research-select" data-agent-id="research-select"></select>
-        <label for="subresearch-select">サブリサーチ</label>
-        <select id="subresearch-select" data-agent-id="subresearch-select"></select>
+        <button class="secondary full research-manage-open" id="research-manage-button" data-agent-id="research-manage-open">リサーチ管理</button>
       </section>
 
       <section>
         <div class="section-title"><span>絞り込み</span><button id="reset-filters" class="text-button" data-agent-id="filters-reset">Reset</button></div>
         <label for="search-input">文献検索</label>
-        <div class="search-wrap"><span>⌕</span><input id="search-input" data-agent-id="patent-search" type="search" placeholder="番号・出願人・タイトル"></div>
-        <label for="year-select">年次</label>
-        <select id="year-select" data-agent-id="year-filter"><option value="all">すべて</option></select>
-        <fieldset>
-          <legend>法的状態</legend>
+        <div class="search-wrap"><input id="search-input" data-agent-id="patent-search" type="search" placeholder="番号・出願人・タイトル"></div>
+        <span class="filter-label">出願年</span>
+        <div class="year-range">
+          <label for="year-from"><span>開始</span><select id="year-from" data-agent-id="year-from-filter"><option value="">指定なし</option></select></label>
+          <span aria-hidden="true">〜</span>
+          <label for="year-to"><span>終了</span><select id="year-to" data-agent-id="year-to-filter"><option value="">指定なし</option></select></label>
+        </div>
+        <fieldset id="legal-status-filters">
+          <legend><span>法的状態</span><button id="legal-status-settings" class="text-button" type="button" data-agent-id="legal-status-settings">判定設定</button></legend>
+          <label class="check-row"><input type="checkbox" value="rights_acquired" checked data-agent-id="status-rights-acquired"><span>権利化</span><i class="dot rights-acquired"></i></label>
+          <label class="check-row"><input type="checkbox" value="under_examination" checked data-agent-id="status-under-examination"><span>審査中</span><i class="dot under-examination"></i></label>
           <label class="check-row"><input type="checkbox" value="published" checked data-agent-id="status-published"><span>公開</span><i class="dot published"></i></label>
-          <label class="check-row"><input type="checkbox" value="registered" checked data-agent-id="status-registered"><span>登録</span><i class="dot registered"></i></label>
-          <label class="check-row"><input type="checkbox" value="unknown" checked data-agent-id="status-unknown"><span>未設定</span><i class="dot unknown"></i></label>
         </fieldset>
+      </section>
+
+      <section id="organization-panel" class="hidden" aria-label="企業分布">
+        <div class="section-title"><span>企業分布</span><button id="organization-clear" class="text-button" data-agent-id="organization-clear">全企業</button></div>
+        <div class="organization-mode" role="group" aria-label="企業集計単位">
+          <button class="active" data-organization-mode="organization" aria-pressed="true">法人別</button>
+          <button data-organization-mode="group" aria-pressed="false">グループ別</button>
+        </div>
+        <p id="organization-scope" class="organization-scope">現在の表示条件 · 0件</p>
+        <div id="organization-ranking" class="organization-ranking"></div>
+        <button class="secondary full" id="organization-groups-manage" data-agent-id="organization-groups-manage">企業グループを管理</button>
       </section>
 
       <section class="sidebar-foot">
@@ -56,6 +70,10 @@
       </section>
     </aside>
 
+    <div id="sidebar-resizer" class="sidebar-resizer" role="separator" aria-label="サイドバーの幅を調整" aria-orientation="vertical" aria-valuemin="180" aria-valuemax="500" aria-valuenow="250" tabindex="0" data-agent-id="sidebar-resizer">
+      <span class="sidebar-resizer-grip" aria-hidden="true"><i></i><i></i><i></i></span>
+    </div>
+
     <div class="content">
       <section class="hero-card">
         <div>
@@ -63,13 +81,12 @@
           <h1 id="research-title">Patent landscape</h1>
           <p id="research-description">リサーチを読み込んでいます…</p>
         </div>
-        <div class="sync-state"><span class="pulse"></span><div><strong>Live filters</strong><small>マップ・一覧へ即時反映</small></div></div>
       </section>
 
       <section class="metrics" aria-label="集計指標">
         <article class="metric"><span>表示文献</span><strong id="metric-visible">0</strong><small id="metric-total">/ 0 total</small></article>
         <article class="metric"><span>分析済み</span><strong id="metric-ready">0</strong><small>pendingは評価から除外</small></article>
-        <article class="metric"><span>登録比率</span><strong id="metric-registered">0%</strong><div class="mini-progress"><i id="registered-bar"></i></div></article>
+        <article class="metric"><span>権利化比率</span><strong id="metric-registered">0%</strong><div class="mini-progress"><i id="registered-bar"></i></div></article>
         <article class="metric accent"><span>高脅威候補</span><strong id="metric-threat">0</strong><small>類似度4+ / 概念高さ4+</small></article>
       </section>
 
@@ -131,9 +148,78 @@
     <div id="preflight-results" class="check-list"></div>
   </dialog>
 
+  <dialog id="research-dialog" class="compact-dialog research-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">RESEARCH LIFECYCLE</p><h2>リサーチ管理</h2></div><button class="icon-button" data-close-dialog="research-dialog" aria-label="閉じる">×</button></div>
+    <div class="research-dialog-grid">
+      <form id="research-create-form">
+        <h3>新しいリサーチ</h3>
+        <label for="research-create-name">リサーチ名</label>
+        <input id="research-create-name" maxlength="120" required placeholder="例：次世代レーザー加工調査">
+        <label for="research-create-id">リサーチID</label>
+        <input id="research-create-id" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" required placeholder="laser_2026">
+        <label for="research-create-description">説明</label>
+        <textarea id="research-create-description" rows="3" maxlength="2000"></textarea>
+        <label for="research-create-company-tech">自社技術定義</label>
+        <textarea id="research-create-company-tech" rows="6" maxlength="20000" required placeholder="対象、入力、処理、制御対象、目的・効果を記載"></textarea>
+        <label for="research-create-csv">特許リストCSV</label>
+        <input id="research-create-csv" type="file" accept=".csv" required>
+        <div id="research-create-validation" class="csv-validation muted">CSVを選択すると事前検証します。</div>
+        <button id="research-create-submit" class="primary full" type="submit">検証して作成</button>
+        <p id="research-create-feedback" class="feedback" aria-live="polite"></p>
+      </form>
+      <section>
+        <h3>既存リサーチ</h3>
+        <label for="research-manage-select">対象リサーチ</label>
+        <select id="research-manage-select"></select>
+        <div id="research-manage-summary" class="research-manage-summary"></div>
+        <label for="research-update-csv">新しい特許リストCSV</label>
+        <input id="research-update-csv" type="file" accept=".csv">
+        <button id="research-update-submit" class="secondary full" type="button">CSVを検証して追加</button>
+        <p id="research-update-feedback" class="feedback" aria-live="polite"></p>
+        <div class="button-row">
+          <button id="research-open-selected" class="secondary" type="button">開く</button>
+          <button id="research-archive-selected" class="danger" type="button">アーカイブ</button>
+          <button id="research-restore-selected" class="primary hidden" type="button">復元</button>
+        </div>
+      </section>
+    </div>
+  </dialog>
+
+  <dialog id="legal-status-dialog" class="compact-dialog legal-status-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">EXACT MATCH RULES</p><h2>法的状態の判定設定</h2></div><button class="icon-button" data-close-dialog="legal-status-dialog" aria-label="閉じる">×</button></div>
+    <p class="muted">CSVの「ステイタス」と完全一致したテキストを分類します。どちらにも一致しない文献はすべて「公開」です。</p>
+    <div class="legal-rule-grid">
+      <section>
+        <h3><i class="dot rights-acquired"></i> 権利化</h3>
+        <div id="rights-acquired-tags" class="tag-editor" data-category="rights_acquired">
+          <div class="tag-chips"></div>
+          <input id="rights-acquired-input" type="text" maxlength="200" placeholder="テキストを入力して Enter または ,">
+        </div>
+      </section>
+      <section>
+        <h3><i class="dot under-examination"></i> 審査中</h3>
+        <div id="under-examination-tags" class="tag-editor" data-category="under_examination">
+          <div class="tag-chips"></div>
+          <input id="under-examination-input" type="text" maxlength="200" placeholder="テキストを入力して Enter または ,">
+        </div>
+      </section>
+      <section class="published-fallback">
+        <h3><i class="dot published"></i> 公開</h3>
+        <p>権利化・審査中のどちらにも完全一致しないステイタスを自動分類します。</p>
+      </section>
+    </div>
+    <div id="legal-status-preview" class="legal-status-preview"></div>
+    <div class="button-row dialog-actions"><button id="legal-status-save" class="primary" type="button" data-agent-id="legal-status-save">保存して反映</button></div>
+    <p id="legal-status-feedback" class="feedback" aria-live="polite"></p>
+  </dialog>
+
   <dialog id="pipeline-dialog" class="compact-dialog pipeline-dialog">
     <div class="dialog-head"><div><p class="eyebrow">LOCAL LLM · CODEX不要</p><h2>夜間一括分析</h2></div><button class="icon-button" data-close-dialog="pipeline-dialog" aria-label="閉じる">×</button></div>
     <p class="pipeline-description">CSVリストの未処理PDFを、VRAMから自動調整した専用Ollamaでタスク別にバッチ分析します。冷却中もモデルを保持し、途中停止後はタスク単位の成果物を再利用します。</p>
+    <div class="pipeline-research-picker">
+      <label for="pipeline-research-select">分析するリサーチ</label>
+      <select id="pipeline-research-select" data-agent-id="pipeline-research-select"></select>
+    </div>
     <p id="pipeline-policy" class="muted">リサーチ設定を読み込んでいます。</p>
     <div id="pipeline-counts" class="pipeline-counts"></div>
     <p class="pipeline-stage-heading">バッチ全体</p>
@@ -164,6 +250,30 @@
         <button id="pipeline-cancel" class="danger small" data-agent-id="pipeline-job-cancel">Cancel</button>
       </div>
       <pre id="pipeline-job-detail"></pre>
+    </div>
+  </dialog>
+
+  <dialog id="organization-dialog" class="compact-dialog organization-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">ORGANIZATION MASTER</p><h2>企業グループ管理</h2></div><button class="icon-button" data-close-dialog="organization-dialog" aria-label="閉じる">×</button></div>
+    <p class="muted">原文企業名は変更せず、集計上のグループだけを登録します。</p>
+    <div class="organization-dialog-grid">
+      <section>
+        <div class="section-title"><strong>登録済みグループ</strong><button id="organization-group-new" class="text-button">新規</button></div>
+        <div id="organization-group-list" class="organization-group-list"></div>
+      </section>
+      <form id="organization-group-form">
+        <input id="organization-group-id" type="hidden">
+        <label for="organization-group-name">グループ名</label>
+        <input id="organization-group-name" maxlength="100" required placeholder="例：Aグループ">
+        <label for="organization-group-scope">適用範囲</label>
+        <select id="organization-group-scope"><option value="common">全リサーチ共通</option><option value="research">このリサーチだけ</option></select>
+        <label for="organization-group-note">根拠メモ</label>
+        <textarea id="organization-group-note" rows="3" maxlength="2000" placeholder="子会社化、社名変更、確認資料など"></textarea>
+        <label class="group-verified"><input id="organization-group-verified" type="checkbox"> 関係を確認済み</label>
+        <fieldset class="organization-members"><legend>構成企業（2社以上）</legend><div id="organization-member-list"></div></fieldset>
+        <div class="button-row"><button class="primary" type="submit" data-agent-id="organization-group-save">保存</button><button id="organization-group-delete" class="danger hidden" type="button">削除</button></div>
+        <p id="organization-group-feedback" class="feedback" aria-live="polite"></p>
+      </form>
     </div>
   </dialog>
 

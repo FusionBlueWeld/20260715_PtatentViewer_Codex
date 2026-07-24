@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "blocks": [
+    {"name":"select_research","description":"表示するリサーチを選択","risk":"low","capability":"filter"},
+    {"name":"set_filters","description":"年、法的状態、検索語をまとめて設定","risk":"low","capability":"filter"},
+    {"name":"reset_filters","description":"表示条件を初期状態へ戻す","risk":"low","capability":"filter"},
+    {"name":"set_view","description":"脅威マップまたは技術マップを表示","risk":"low","capability":"map"},
+    {"name":"select_threat_cell","description":"脅威マップのセルを選択","risk":"low","capability":"map"},
+    {"name":"clear_cell","description":"マップセル選択を解除","risk":"low","capability":"map"},
+    {"name":"set_cluster_min_size","description":"技術マップの最小クラスタ件数を設定","risk":"low","capability":"map"},
+    {"name":"open_patent","description":"文献を選択して詳細を表示","risk":"low","capability":"map"},
+    {"name":"preview_pdf","description":"選択文献のPDFを可視UIで開く","risk":"low","capability":"pdf-preview"},
+    {"name":"close_pdf","description":"PDFプレビューを閉じる","risk":"low","capability":"pdf-preview"},
+    {"name":"save_interpretation","description":"選択文献へ解釈メモを保存","risk":"medium","capability":"interpretation","writes":true},
+    {"name":"open_preflight","description":"選択リサーチのLLM事前診断を表示","risk":"low","capability":"llm-preflight"},
+    {"name":"open_research_manager","description":"リサーチ管理画面を開く","risk":"low","capability":"filter"},
+    {"name":"open_legal_status_settings","description":"法的状態の判定設定を開く","risk":"low","capability":"filter"},
+    {"name":"open_organization_groups","description":"企業グループ管理を開く","risk":"low","capability":"map"},
+    {"name":"open_pipeline","description":"夜間一括分析画面を開く","risk":"low","capability":"research-pipeline"},
+    {"name":"prepare_pipeline","description":"PDF抽出と規則ベース前処理を開始","risk":"medium","capability":"research-pipeline","writes":true},
+    {"name":"execute_pipeline","description":"ローカルLLM一括分析を開始","risk":"high","capability":"research-pipeline","writes":true,"heavy":true,"confirmation":"RUN_LOCAL_LLM"},
+    {"name":"pipeline_control","description":"実行中の分析をpause/resume/cancel","risk":"medium","capability":"pipeline-control","writes":true}
+  ]
+}

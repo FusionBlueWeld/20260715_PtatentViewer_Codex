@@ -35,13 +35,17 @@ PatentViewerは、独立した共有PDFプールにある同じ特許文献を�
 
 - `research.json`：自社技術、既定の読取方針、5×5評価方針
 - `patent_list_{yyyymmddHHMMSS}.csv`：本番環境の優先入力。最新タイムスタンプ1件をCP932で直接読み込む。入力仕様は [PATENT_LIST_CSV_SPEC.md](PATENT_LIST_CSV_SPEC.md) を参照
-- `subresearches/*/patents.json`：CSVがない既存・デバッグ用リサーチの互換入力
-- `subresearches/*/pipeline/<patent-id>/`：文献別の段階成果物
+- `patents.json`：CSVがないデバッグ・手動リサーチのJSON入力
+- `pipeline/<patent-id>/`：文献別の段階成果物
 - `clustering/<run-id>/`：リサーチ全対象を母集団としたクラスタ計算・命名
-- `subresearches/*/results/<patent-id>.json`：UI用の確定結果
+- `results/<patent-id>.json`：UI用の確定結果
 - `runs/<run-id>/run_manifest.json`：実行条件、段階、成否、成果物参照
 
-サブリサーチは対象文献の分類・絞り込み単位である。クラスタの既定スコープはサブリサーチ単位ではなく、リサーチ全体とする。
+対象文献、段階成果物、確定結果、クラスタはすべてリサーチを境界とする。分類は文献の `category` と `tags` で表現する。移行前の `subresearches/*` は読込互換のみとし、新規書込みには使用しない。
+
+新規リサーチはUIから作成し、`research.json`、`company_tech.txt`、初回CSVを検証後に一括確定する。`research.json.lifecycle.status` は `active` または `archived`、`analysis_stale` は最新版CSVへの切替後から全件再分析完了まで真とする。アーカイブではフォルダを移動せず、通常一覧と分析対象から除外して成果物参照を保つ。
+
+法的状態の表示分類は `research.json.legal_status_rules` にリサーチ単位で保存する。CSVの `ステイタス` 原文と完全一致する文字列だけを「権利化」または「審査中」へ分類し、どちらにも一致しない値は「公開」とする。同一文字列を両方へ登録することは禁止する。これは表示・集計用の派生分類であり、変更時に分析成果物を再生成しない。年次の表示・範囲指定にはCSVの `出願日` の年を使用する。
 
 自社技術プロンプトは、当面ユーザーが各リサーチフォルダの `company_tech.txt` へUTF-8テキストとして格納する。分析時は `company_tech.txt` を優先し、存在しない既存リサーチだけ `research.json` の `company_technology` へフォールバックする。将来はアプリ上でアップロードまたは編集し、対象リサーチへの保存、版管理、分析への反映まで画面内で完結させる。
 

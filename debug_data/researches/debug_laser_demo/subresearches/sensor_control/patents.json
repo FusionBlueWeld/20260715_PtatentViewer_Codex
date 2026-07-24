@@ -1,9 +1,0 @@
-{
-  "name": "センシング・制御",
-  "description": "DEBUG専用fixture A",
-  "patents": [
-    {"pdf":"特開2026-70800.pdf","title":"加工状態の光学センシングと出力補正","applicant":"Debug Optics","category":"競合A","tags":["センシング","制御"]},
-    {"pdf":"特開2026-69331.pdf","title":"溶融池推定によるレーザー条件制御","applicant":"Debug Laser","category":"競合B","tags":["状態推定","閉ループ"]},
-    {"pdf":"特許第7843458号.pdf","year":2026,"title":"加工装置および監視制御方法","applicant":"Debug Systems","category":"自社候補","tags":["登録","監視"]}
-  ]
-}

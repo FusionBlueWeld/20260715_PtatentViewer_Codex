@@ -3,7 +3,29 @@
   "description": "レーザー加工のセンシング、状態推定、照射条件制御に関する公開・登録特許を横断比較します。",
   "company_technology": "センシングから加工状態を推定し、レーザー照射条件とビームプロファイルを逐次補正する閉ループ加工技術",
   "pipeline": {
-    "source_policy": {"extraction": "verify_original", "reading": "adaptive"},
-    "threat_scoring": {"map": "5x5", "x_axis": "similarity", "y_axis": "concept_level", "primary_evidence": "independent_claims", "embedding_is_scoring_evidence": false}
+    "source_policy": {
+      "extraction": "verify_original",
+      "reading": "adaptive"
+    },
+    "threat_scoring": {
+      "map": "5x5",
+      "x_axis": "similarity",
+      "y_axis": "concept_level",
+      "primary_evidence": "independent_claims",
+      "embedding_is_scoring_evidence": false
+    }
+  },
+  "schema_version": 2,
+  "legal_status_rules": {
+    "version": 1,
+    "rights_acquired": [
+      "登録（権利有）"
+    ],
+    "under_examination": [
+      "通常審査中"
+    ]
+  },
+  "lifecycle": {
+    "updated_at": "2026-07-24T17:58:50+09:00"
   }
 }

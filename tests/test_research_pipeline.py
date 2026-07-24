@@ -141,21 +141,21 @@ class ResearchPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             research_dir = root / "researches/sample"
-            artifact = research_dir / "subresearches/group/pipeline/P1"
+            artifact = research_dir / "pipeline/P1"
             artifact.mkdir(parents=True)
             (research_dir / "research.json").write_text("{}", encoding="utf-8")
             pipeline = ResearchPipeline(root, "normal", "sample")
             checkpoint = artifact / "analysis_complete.json"
             checkpoint.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
-            self.assertFalse(pipeline.analysis_checkpoint_current("group", "P1.pdf"))
+            self.assertFalse(pipeline.analysis_checkpoint_current("P1.pdf"))
             checkpoint.write_text(json.dumps({"pipeline_version": ANALYSIS_PIPELINE_VERSION}), encoding="utf-8")
-            self.assertTrue(pipeline.analysis_checkpoint_current("group", "P1.pdf"))
+            self.assertTrue(pipeline.analysis_checkpoint_current("P1.pdf"))
 
     def test_prepared_document_can_be_reloaded_for_a_durable_shard(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             research_dir = root / "researches/sample"
-            artifact = research_dir / "subresearches/group/pipeline/P1"
+            artifact = research_dir / "pipeline/P1"
             cache = root / "runtime/shared/extractions/hash"
             artifact.mkdir(parents=True)
             cache.mkdir(parents=True)
@@ -168,7 +168,7 @@ class ResearchPipelineTests(unittest.TestCase):
                 "claims": [{"number": 1, "type": "independent", "text": "claim"}], "sections": {},
             })
             pipeline = ResearchPipeline(root, "normal", "sample")
-            prepared = pipeline.load_prepared_document("group", "P1.pdf")
+            prepared = pipeline.load_prepared_document("P1.pdf")
             self.assertEqual(prepared["artifact_dir"], artifact)
             self.assertEqual(prepared["cache_dir"], cache.resolve())
             self.assertEqual(prepared["structure"]["claims"][0]["number"], 1)
@@ -177,7 +177,7 @@ class ResearchPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             research_dir = root / "researches/sample"
-            artifact = research_dir / "subresearches/group/pipeline/P1"
+            artifact = research_dir / "pipeline/P1"
             cache = root / "runtime/shared/extractions/hash"
             artifact.mkdir(parents=True)
             cache.mkdir(parents=True)
@@ -212,7 +212,7 @@ class ResearchPipelineTests(unittest.TestCase):
                 {"technology_summary": "自社技術", "problem_summary": "自社課題"},
                 [[1.0] * 128, [1.0] * 128],
             )
-            finalized = pipeline.finalize_research({"P1": analysis}, {"P1": "group"}, generate, "run-1", company_reference=company_reference)
+            finalized = pipeline.finalize_research({"P1": analysis}, generate, "run-1", company_reference=company_reference)
             result_path = root / finalized["results"]["P1"]
             result = json.loads(result_path.read_text(encoding="utf-8"))
             self.assertEqual(result["similarity"], 3)
@@ -223,7 +223,7 @@ class ResearchPipelineTests(unittest.TestCase):
             clusters = json.loads((research_dir / "clustering/run-1/clusters.json").read_text(encoding="utf-8"))
             self.assertEqual(clusters["semantic_ordering"]["technology_order"], [0])
             self.assertIn("company_proximity", clusters)
-            reloaded = pipeline.load_analysis_artifacts("group", "P1.pdf")
+            reloaded = pipeline.load_analysis_artifacts("P1.pdf")
             self.assertEqual(reloaded["score"]["similarity"], 3)
             self.assertEqual(reloaded["summaries"]["tech_summary"], "技術")
             self.assertEqual(reloaded["embedding"]["input_order"], ["technology", "problem"])
@@ -233,7 +233,7 @@ class ResearchPipelineTests(unittest.TestCase):
             pdf_path = root / "patent_pool/P1.pdf"
             pdf_path.parent.mkdir(parents=True)
             pdf_path.write_bytes(b"pdf")
-            pipeline.patents = lambda: [("group", pdf_path, {})]
+            pipeline.patents = lambda: [(pdf_path, {})]
             overview = pipeline.overview()
             self.assertEqual(overview["counts"]["failed"], 1)
             self.assertEqual(overview["documents"][0]["analysis_error"]["error"], "invalid JSON")

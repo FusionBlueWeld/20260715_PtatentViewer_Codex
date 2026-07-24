@@ -11,7 +11,10 @@ from tests.support import build_fixture
 
 import sys
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-from patent_viewer.domain import DataError, PATENT_LIST_HEADERS, Repository, infer_status, infer_year, patent_key, safe_id
+from patent_viewer.domain import (
+    DataError, PATENT_LIST_HEADERS, Repository, application_year, classify_legal_status,
+    infer_status, infer_year, patent_key, safe_id,
+)
 
 
 class DomainTests(unittest.TestCase):
@@ -26,6 +29,15 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(infer_status("JPA 2026000001-000000"), "published")
         self.assertEqual(infer_status("JPB 000000001-000000"), "registered")
         self.assertEqual(patent_key("JPA 2026000001-000000.pdf"), "JPA_2026000001-000000")
+        self.assertEqual(application_year("2024.01.02"), 2024)
+        self.assertIsNone(application_year("特願2024-2"))
+
+    def test_legal_status_uses_exact_rules_and_published_fallback(self):
+        rules = {"rights_acquired": ["登録（権利有）"], "under_examination": ["通常審査中"]}
+        self.assertEqual(classify_legal_status("登録（権利有）", rules), "rights_acquired")
+        self.assertEqual(classify_legal_status("通常審査中", rules), "under_examination")
+        self.assertEqual(classify_legal_status("登録（権利有：審判完）", rules), "published")
+        self.assertEqual(classify_legal_status("", rules), "published")
 
     def test_production_pdf_filename_formats(self):
         cases = [
@@ -51,7 +63,7 @@ class DomainTests(unittest.TestCase):
     def test_dashboard_accepts_japanese_publication_filename(self):
         filename = "特開平5-123456.pdf"
         (self.root / "patent_pool" / filename).write_bytes(b"%PDF-1.4\n%%EOF")
-        manifest_path = self.root / "researches/normal_research/subresearches/sample/patents.json"
+        manifest_path = self.root / "researches/normal_research/patents.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["patents"].append({"pdf": filename})
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
@@ -68,7 +80,7 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(self.repo.dashboard("normal", "normal_research")["research"]["company_technology"], "リサーチ固有の自社技術")
 
     def test_missing_pdf_remains_visible_as_skipped(self):
-        manifest_path = self.root / "researches/normal_research/subresearches/sample/patents.json"
+        manifest_path = self.root / "researches/normal_research/patents.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["patents"].append({"pdf": "WO2024-999999.pdf", "title": "missing document"})
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
@@ -77,6 +89,38 @@ class DomainTests(unittest.TestCase):
         self.assertFalse(patent["pdf_available"])
         self.assertEqual(patent["analysis_state"], "skipped")
         self.assertEqual(patent["skip_reason"], "pdf_not_found")
+
+    def test_organization_registry_and_group_scopes(self):
+        manifest_path = self.root / "researches/normal_research/patents.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["patents"][0]["applicant"] = "株式会社A；株式会社B"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        dashboard = self.repo.dashboard("normal", "normal_research")
+        organizations = dashboard["organization_registry"]["organizations"]
+        self.assertEqual({item["name"] for item in organizations}, {"株式会社A", "株式会社B"})
+        self.assertEqual(len(dashboard["patents"][0]["applicant_organization_ids"]), 2)
+
+        result = self.repo.save_organization_group("normal", "normal_research", {
+            "scope": "common", "name": "Aグループ", "member_ids": [item["id"] for item in organizations],
+            "members": organizations, "note": "確認済み", "verified": True,
+        })
+        self.assertTrue((self.root / "config/organization_registry.json").is_file())
+        self.assertEqual(result["group"]["name"], "Aグループ")
+        refreshed = self.repo.dashboard("normal", "normal_research")
+        self.assertEqual(refreshed["organization_registry"]["groups"][0]["scope"], "common")
+
+        self.repo.save_organization_group("normal", "normal_research", {
+            "scope": "research", "name": "調査限定", "member_ids": [item["id"] for item in organizations],
+            "members": organizations,
+        })
+        self.assertTrue((self.root / "researches/normal_research/organization_overrides.json").is_file())
+        self.assertEqual(len(self.repo.dashboard("normal", "normal_research")["organization_registry"]["groups"]), 2)
+
+    def test_organization_group_requires_two_members(self):
+        with self.assertRaises(DataError):
+            self.repo.save_organization_group("normal", "normal_research", {
+                "scope": "common", "name": "invalid", "member_ids": ["org_0000000000000000"],
+            })
 
     def test_latest_cp932_csv_is_loaded_and_pdf_priority_is_applied(self):
         research = self.root / "researches/production_csv"
@@ -107,7 +151,24 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(dashboard["patents"][0]["pdf"], "特開2024-001234.pdf")
         self.assertEqual(dashboard["patents"][1]["pdf"], "特許第7654321号.pdf")
         self.assertEqual(dashboard["patents"][1]["source_ai_score"], 70.0)
+        self.assertEqual(dashboard["patents"][1]["year"], 2024)
+        self.assertEqual(dashboard["patents"][1]["year_source"], "application_date")
+        self.assertEqual(dashboard["patents"][0]["legal_status_category"], "under_examination")
+        self.assertEqual(dashboard["patents"][1]["legal_status_category"], "rights_acquired")
+        self.assertEqual(dashboard["patents"][2]["legal_status_category"], "published")
         self.assertEqual(dashboard["patents"][2]["analysis_state"], "skipped")
+
+        saved = self.repo.save_legal_status_rules("normal", "production_csv", {
+            "rights_acquired": ["登録（権利有）", "審査請求無し"],
+            "under_examination": ["通常審査中"],
+        })
+        self.assertEqual(saved["legal_status_rules"]["rights_acquired"][-1], "審査請求無し")
+        refreshed = self.repo.dashboard("normal", "production_csv")
+        self.assertEqual(refreshed["patents"][2]["legal_status_category"], "rights_acquired")
+        with self.assertRaises(DataError):
+            self.repo.save_legal_status_rules("normal", "production_csv", {
+                "rights_acquired": ["重複"], "under_examination": ["重複"],
+            })
 
     def test_preflight_requires_valid_claim_structure(self):
         class Response:
@@ -120,7 +181,7 @@ class DomainTests(unittest.TestCase):
             blocked = self.repo.preflight("normal", "normal_research")
             claim_check = next(item for item in blocked["checks"] if item["id"] == "claim-structure")
             self.assertFalse(claim_check["ok"])
-            structure = self.root / "researches/normal_research/subresearches/sample/pipeline/JPA_2026000001-000000/document_structure.json"
+            structure = self.root / "researches/normal_research/pipeline/JPA_2026000001-000000/document_structure.json"
             structure.parent.mkdir(parents=True)
             structure.write_text(json.dumps({
                 "schema_version": 2, "claims": [{"number": 1, "text": "claim"}],
@@ -139,18 +200,18 @@ class DomainTests(unittest.TestCase):
 
         second_pdf = "JPA 2026000002-000000.pdf"
         (self.root / "patent_pool" / second_pdf).write_bytes(b"%PDF-1.4\n%%EOF")
-        manifest_path = self.root / "researches/normal_research/subresearches/sample/patents.json"
+        manifest_path = self.root / "researches/normal_research/patents.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["patents"].append({"pdf": second_pdf, "year": 2026})
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-        first = self.root / "researches/normal_research/subresearches/sample/pipeline/JPA_2026000001-000000/document_structure.json"
+        first = self.root / "researches/normal_research/pipeline/JPA_2026000001-000000/document_structure.json"
         first.parent.mkdir(parents=True)
         first.write_text(json.dumps({
             "schema_version": 2, "claims": [{"number": 1, "text": "claim"}],
             "claim_validation": {"valid": True, "errors": []},
         }), encoding="utf-8")
-        skipped = self.root / "researches/normal_research/subresearches/sample/pipeline/JPA_2026000002-000000/skip.json"
+        skipped = self.root / "researches/normal_research/pipeline/JPA_2026000002-000000/skip.json"
         skipped.parent.mkdir(parents=True)
         skipped.write_text(json.dumps({"reason": "image_only_or_insufficient_text"}), encoding="utf-8")
 
@@ -176,9 +237,28 @@ class DomainTests(unittest.TestCase):
 
     def test_path_traversal_rejected(self):
         with self.assertRaises(DataError): self.repo.pdf_path("../secret.pdf")
-        manifest = self.root / "researches/normal_research/subresearches/sample/patents.json"
+        manifest = self.root / "researches/normal_research/patents.json"
         manifest.write_text(json.dumps({"patents":[{"pdf":"../outside.pdf"}]}), encoding="utf-8")
         with self.assertRaises(DataError): self.repo.dashboard("normal", "normal_research")
+
+    def test_legacy_subresearch_is_read_only_compatibility_input(self):
+        research = self.root / "researches/legacy_research"
+        legacy = research / "subresearches/old_group"
+        (legacy / "results").mkdir(parents=True)
+        (research / "research.json").write_text("{}", encoding="utf-8")
+        (legacy / "patents.json").write_text(json.dumps({
+            "name": "旧分類", "patents": [{"pdf": "JPA 2026000001-000000.pdf"}],
+        }, ensure_ascii=False), encoding="utf-8")
+        key = "JPA_2026000001-000000"
+        (legacy / f"results/{key}.json").write_text(json.dumps({
+            "similarity": 3, "concept_level": 3, "tech_summary": "技術",
+            "problem_summary": "課題", "reasoning": "根拠",
+            "tech_cluster": "分類", "problem_cluster": "課題分類",
+        }, ensure_ascii=False), encoding="utf-8")
+        dashboard = self.repo.dashboard("normal", "legacy_research")
+        self.assertEqual(dashboard["patents"][0]["analysis_state"], "ready")
+        self.assertEqual(dashboard["patents"][0]["category"], "旧分類")
+        self.assertEqual(dashboard["input"]["legacy_inputs"], ["old_group"])
 
 
 if __name__ == "__main__": unittest.main()

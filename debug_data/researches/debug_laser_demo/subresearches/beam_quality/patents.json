@@ -1,9 +1,0 @@
-{
-  "name": "ビーム・品質",
-  "description": "DEBUG専用fixture B",
-  "patents": [
-    {"pdf":"特開2025-184591.pdf","title":"ビームプロファイル可変加工","applicant":"Debug Beam","category":"競合A","tags":["ビーム","2025"]},
-    {"pdf":"特開2024-172352.pdf","title":"加工欠陥予測と品質判定","applicant":"Debug Quality","category":"競合C","tags":["品質","AI"]},
-    {"pdf":"特許第7792585号.pdf","year":2025,"title":"レーザー加工条件の学習更新装置","applicant":"Debug Learning","category":"競合B","tags":["登録","学習"]}
-  ]
-}

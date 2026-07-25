@@ -84,7 +84,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(overview["threat_map"], {})
         next((self.root / "researches/normal_research/results").glob("*.json")).unlink()
         overview = self.request("/api/researches/normal_research/pipeline?environment=normal")
-        self.assertEqual(overview["counts"]["pending"], 1)
+        # Once indexed, SQLite is authoritative; removing the legacy JSON
+        # compatibility artifact must not discard a completed result.
+        self.assertEqual(overview["counts"]["pending"], 0)
         self.request("/api/researches/normal_research/pipeline/jobs", {
             "environment": "normal", "mode": "execute", "source": "human"
         }, expected=400)
@@ -123,6 +125,11 @@ class ApiTests(unittest.TestCase):
                 self.assertIn("--cooldown-seconds", command)
                 self.assertEqual(command[command.index("--cooldown-seconds") + 1], "30")
                 self.assertIn("--ollama-url", command)
+                self.assertIn("--rescue-model", command)
+                self.assertEqual(
+                    command[command.index("--rescue-model") + 1],
+                    "gpt-oss:20b",
+                )
                 self.assertIn("--generation-workers", command)
                 self.assertIn("--embedding-batch-size", command)
                 self.assertIn("--shard-size", command)
@@ -147,7 +154,10 @@ class ApiTests(unittest.TestCase):
         script = (project / "public/assets/app.js").read_text(encoding="utf-8")
         self.assertIn('id="pipeline-overwrite"', html)
         self.assertIn("全件を再分析", html)
-        self.assertIn("const overwrite=mode==='execute'&&$('#pipeline-overwrite').checked", script)
+        self.assertIn("requested.overwrite??$('#pipeline-overwrite').checked", script)
+        self.assertIn("overwrite:$('#pipeline-overwrite').checked", script)
+        self.assertIn("$('#pipeline-overwrite').checked=request.overwrite", script)
+        self.assertIn("runPipelineMode('execute',request)", script)
         self.assertIn('id="pipeline-research-select"', html)
         self.assertIn('id="research-create-form"', html)
         self.assertIn('id="year-from"', html)
@@ -157,6 +167,32 @@ class ApiTests(unittest.TestCase):
         self.assertIn('id="sidebar-resizer"', html)
         self.assertIn("SIDEBAR_MAX_WIDTH=500", script)
         self.assertIn("p.legal_status_category||'published'", script)
+        self.assertIn('id="claim-dialog"', html)
+        self.assertIn("verifiedClaimEvidence", script)
+        self.assertIn("権利範囲の広さ", html)
+        self.assertIn("権利範囲の広さ", script)
+        self.assertNotIn("概念高さ", html)
+        self.assertNotIn("概念高さ", script)
+
+    def test_claim_scope_breadth_prompt_defines_consistent_scale(self):
+        project = Path(__file__).parents[1]
+        prompt = (
+            project / "src/patent_viewer/prompts/stages/concept_level.txt"
+        ).read_text(encoding="utf-8")
+        schema = json.loads(
+            (project / "schemas/llm-concept-level.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn("文言上の権利範囲の広さ", prompt)
+        self.assertIn("最も権利範囲が広い独立請求項", prompt)
+        self.assertIn("必須構成要件や具体的な限定が多いほど", prompt)
+        self.assertIn("1: 非常に狭い", prompt)
+        self.assertIn("5: 非常に広い", prompt)
+        self.assertIn(
+            "文言上の権利範囲の広さ",
+            schema["properties"]["concept_level"]["description"],
+        )
 
     def test_legal_status_rule_api_uses_exact_match_and_application_year(self):
         manifest_path = self.root / "researches/normal_research/patents.json"

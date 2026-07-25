@@ -3,8 +3,15 @@
   "title": "Local LLM technology summary",
   "type": "object",
   "additionalProperties": false,
-  "required": ["tech_summary"],
+  "required": ["tech_summary", "source_ids"],
   "properties": {
-    "tech_summary": {"type": "string", "minLength": 1, "maxLength": 800}
+    "tech_summary": {"type": "string", "minLength": 1, "maxLength": 800},
+    "source_ids": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 80},
+      "minItems": 1,
+      "maxItems": 4,
+      "uniqueItems": true
+    }
   }
 }

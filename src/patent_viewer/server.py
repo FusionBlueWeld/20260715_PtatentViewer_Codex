@@ -93,6 +93,7 @@ class AppState:
                 "--environment", environment, "--stage", mode,
                 "--events-file", str(events_file), "--control-file", str(control_file),
                 "--ollama-url", self.ollama_url,
+                "--rescue-model", "gpt-oss:20b",
                 "--generation-workers", str(self.runtime_config.generation_workers),
                 "--embedding-batch-size", str(self.runtime_config.embedding_batch_size),
                 "--shard-size", str(self.runtime_config.shard_size),
@@ -245,6 +246,7 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
@@ -284,7 +286,37 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/researches/") and path.endswith("/dashboard"):
             research_id = path.split("/")[3]
             env = query.get("environment", [self.state.environment])[0]
-            return self._json(200, self.state.repo.dashboard(env, research_id))
+            include_patents = query.get("include_patents", ["true"])[0].lower() not in {"0", "false", "no"}
+            return self._json(200, self.state.repo.dashboard(env, research_id, include_patents=include_patents))
+        if path.startswith("/api/researches/") and path.endswith("/documents"):
+            research_id = path.split("/")[3]
+            env = query.get("environment", [self.state.environment])[0]
+
+            def integer(name: str, default: int | None = None) -> int | None:
+                raw = query.get(name, [None])[0]
+                if raw in {None, ""}:
+                    return default
+                try:
+                    return int(raw)
+                except (TypeError, ValueError) as exc:
+                    raise DataError(f"{name}は整数で指定してください") from exc
+
+            return self._json(200, self.state.repo.document_page(
+                env,
+                research_id,
+                limit=integer("limit", 200),
+                offset=integer("offset", 0),
+                query=query.get("q", [""])[0],
+                year_from=integer("year_from"),
+                year_to=integer("year_to"),
+                statuses=[item for value in query.get("status", []) for item in value.split(",") if item],
+                analysis_states=[item for value in query.get("analysis_state", []) for item in value.split(",") if item],
+                similarity=integer("similarity"),
+                concept_level=integer("concept_level"),
+                tech_cluster_id=query.get("tech_cluster_id", [None])[0],
+                problem_cluster_id=query.get("problem_cluster_id", [None])[0],
+                organization_ids=[item for value in query.get("organization_id", []) for item in value.split(",") if item],
+            ))
         if path.startswith("/api/researches/") and path.endswith("/llm-preflight"):
             research_id = path.split("/")[3]
             env = query.get("environment", [self.state.environment])[0]
@@ -292,7 +324,8 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/researches/") and path.endswith("/pipeline"):
             research_id = path.split("/")[3]
             env = query.get("environment", [self.state.environment])[0]
-            overview = ResearchPipeline(self.state.root, env, research_id).overview()
+            compact = query.get("compact", ["false"])[0].lower() in {"1", "true", "yes"}
+            overview = ResearchPipeline(self.state.root, env, research_id).overview(compact=compact)
             active = [self.state.pipeline_job(job_id) for job_id, job in self.state.pipeline_jobs.items() if job["environment"] == env and job["research_id"] == research_id]
             overview["jobs"] = sorted(active, key=lambda item: item["created_at"], reverse=True)[:10]
             return self._json(200, overview)
@@ -451,7 +484,7 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
             if body.get("source") == "codex" and not self._authorized_codex(env):
                 return self._json(403, {"error": "Codexのpipeline実行は実行中の可視UIコマンドが必要です"})
             if mode == "execute":
-                overview = ResearchPipeline(self.state.root, env, research_id).overview()
+                overview = ResearchPipeline(self.state.root, env, research_id).overview(compact=True)
                 if overview.get("analysis_stale") and not body.get("overwrite"):
                     raise DataError("最新版CSVへの切替後は全件再分析を選択してください")
                 if body.get("confirmation") != "RUN_LOCAL_LLM":

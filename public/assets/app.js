@@ -6,10 +6,12 @@ const state = {
   environment: 'normal', researches: [], dashboard: null, visible: [], selected: null,
   cellFilter: null, view: 'threat', pipelineJob: null, pipelineReady: false, pipelineRunnable: false, pipelinePending: 0, pipelineAvailable: 0, techClusterMinSize: 1,
   organizationMode: 'organization', selectedOrganization: null, editingOrganizationGroup: null,
-  pipelineResearchId: null, managedResearches: [], legalStatusDraft: { rights_acquired: [], under_examination: [] }
+  pipelineResearchId: null, managedResearches: [], legalStatusDraft: { rights_acquired: [], under_examination: [] },
+  documentPage: { total: 0, offset: 0, limit: 200, hasMore: false, loading: false, request: 0 }, filterTimer: null
 };
 
 const statusLabel = { rights_acquired: '権利化', under_examination: '審査中', published: '公開', registered: '権利化', unknown: '公開' };
+const legalCategory = p => p.legal_status_category||'published';
 const displayStatus = patent => patent.source_status || statusLabel[patent.legal_status_category] || statusLabel[patent.status] || '公開';
 const analysisValue = (patent, key) => patent.analysis_state === 'ready' ? patent[key] : null;
 
@@ -59,16 +61,16 @@ async function loadResearches(preferred) {
 }
 
 async function loadDashboard(researchId) {
-  state.dashboard = await api(`/api/researches/${encodeURIComponent(researchId)}/dashboard?environment=${state.environment}`);
+  state.dashboard = await api(`/api/researches/${encodeURIComponent(researchId)}/dashboard?environment=${state.environment}&include_patents=false`);
   state.selected = null; state.cellFilter = null; state.selectedOrganization = null; state.editingOrganizationGroup = null;
   $('#research-title').textContent = state.dashboard.research.name;
   $('#research-description').textContent = state.dashboard.research.description;
   $('#pool-count').textContent = state.dashboard.pool_count;
-  rebuildYears(); applyFilters(); renderInterpretation();
+  rebuildYears(); await refreshDocuments(true); renderInterpretation();
 }
 
 function rebuildYears() {
-  const years = [...new Set(state.dashboard.patents.map(p => Number(p.year)).filter(Boolean))].sort((a,b) => a-b);
+  const years = (state.dashboard.aggregates?.years||[]).map(Number).filter(Boolean).sort((a,b) => a-b);
   for (const selector of ['#year-from','#year-to']) {
     const select=$(selector);select.innerHTML='<option value="">指定なし</option>';
     years.forEach(year=>select.add(new Option(`${year}年`,year)));
@@ -85,26 +87,46 @@ function filters() {
 }
 
 function applyFilters() {
-  if (!state.dashboard) return;
-  const f = filters();
-  state.visible = state.dashboard.patents.filter(p => {
-    const haystack = [p.publication_number,p.title,p.applicant,p.category,...p.tags].join(' ').toLowerCase();
-    const year=Number(p.year)||null,yearMatches=(!f.yearFrom&&!f.yearTo)||(year!==null&&(!f.yearFrom||year>=f.yearFrom)&&(!f.yearTo||year<=f.yearTo));
-    return yearMatches
-      && f.statuses.has(p.legal_status_category||'published')
-      && (!f.query || haystack.includes(f.query));
-  });
-  renderMetrics(); renderThreatMap(); renderTechnologyMap(); renderPatentList(); renderOrganizationRanking();
+  if (!state.dashboard) return Promise.resolve();
+  clearTimeout(state.filterTimer);
+  return new Promise(resolve=>{state.filterTimer=setTimeout(()=>refreshDocuments(true).finally(resolve),120);});
 }
 
+function documentQuery(offset=0){
+  const f=filters(),parameters=new URLSearchParams({environment:state.environment,limit:String(state.documentPage.limit),offset:String(offset)});
+  if(f.query)parameters.set('q',f.query);
+  if(f.yearFrom)parameters.set('year_from',String(f.yearFrom));
+  if(f.yearTo)parameters.set('year_to',String(f.yearTo));
+  parameters.set('status',f.statuses.size?[...f.statuses].join(','):'__none__');
+  if(state.cellFilter?.type==='threat'){parameters.set('similarity',String(state.cellFilter.x));parameters.set('concept_level',String(state.cellFilter.y));}
+  if(state.cellFilter?.type==='technology'){parameters.set('tech_cluster_id',String(state.cellFilter.tech));parameters.set('problem_cluster_id',String(state.cellFilter.problem));}
+  if(state.selectedOrganization?.memberIds?.length)parameters.set('organization_id',state.selectedOrganization.memberIds.join(','));
+  return parameters;
+}
+
+async function refreshDocuments(reset=true){
+  if(!state.dashboard||(state.documentPage.loading&&!reset))return;
+  const request=++state.documentPage.request,offset=reset?0:state.visible.length;state.documentPage.loading=true;
+  try{
+    const researchId=encodeURIComponent(state.dashboard.research.id);
+    const page=await api(`/api/researches/${researchId}/documents?${documentQuery(offset)}`);
+    if(request!==state.documentPage.request)return;
+    state.visible=reset?page.items:[...state.visible,...page.items];
+    state.documentPage={...state.documentPage,total:page.total,offset:page.offset,hasMore:page.has_more,loading:false,request};
+    state.dashboard.aggregates=page.aggregates;
+    state.dashboard.selectionAggregates=page.selection_aggregates;
+    state.dashboard.overlayAggregates=page.overlay_aggregates;
+    renderMetrics();renderThreatMap();renderTechnologyMap();renderPatentList();renderOrganizationRanking();
+  }finally{if(request===state.documentPage.request)state.documentPage.loading=false;}
+}
+
+function loadMoreDocuments(){if(state.documentPage.hasMore&&!state.documentPage.loading)return refreshDocuments(false);}
+
 function renderMetrics() {
-  const total = state.dashboard.patents.length, visible = state.visible.length;
-  const ready = state.visible.filter(p => p.analysis_state === 'ready');
-  const registered = state.visible.filter(p => p.legal_status_category === 'rights_acquired').length;
-  const threat = ready.filter(p => Number(p.similarity) >= 4 && Number(p.concept_level) >= 4).length;
-  $('#metric-visible').textContent = visible; $('#metric-total').textContent = `/ ${total} total`;
-  $('#metric-ready').textContent = ready.length; $('#metric-registered').textContent = visible ? `${Math.round(registered/visible*100)}%` : '0%';
-  $('#registered-bar').style.width = visible ? `${registered/visible*100}%` : '0%'; $('#metric-threat').textContent = threat;
+  const metrics=state.dashboard.aggregates?.metrics||{},total=Number(metrics.total||0),registered=Number(metrics.registered||0);
+  $('#metric-visible').textContent=total;$('#metric-total').textContent=`/ ${state.researches.find(item=>item.id===state.dashboard.research.id)?.document_count||total} total`;
+  $('#metric-ready').textContent=Number(metrics.ready||0);$('#metric-registered').textContent=total?`${Math.round(registered/total*100)}%`:'0%';
+  $('#registered-bar').style.width=total?`${registered/total*100}%`:'0%';$('#metric-threat').textContent=Number(metrics.threat||0);
 }
 
 function organizationRegistry(){return state.dashboard?.organization_registry||{organizations:[],groups:[]};}
@@ -114,23 +136,24 @@ function organizationMatches(patent,selection=state.selectedOrganization){
 }
 function organizationRankingItems(){
   const registry=organizationRegistry();
+  const counts=new Map((state.dashboard?.aggregates?.organization_counts||[]).map(item=>[item.organization_id,Number(item.count||0)]));
   if(state.organizationMode==='group')return (registry.groups||[]).map(group=>{
-    const members=group.member_ids||[];const count=state.visible.filter(p=>members.some(id=>patentOrganizationIds(p).has(id))).length;
+    const members=group.member_ids||[];const count=members.reduce((total,id)=>total+(counts.get(id)||0),0);
     return {type:'group',id:group.id,name:group.name,memberIds:members,count,scope:group.scope};
   }).filter(item=>item.count>0).sort((a,b)=>b.count-a.count||a.name.localeCompare(b.name,'ja'));
-  return (registry.organizations||[]).map(org=>({type:'organization',id:org.id,name:org.name,memberIds:[org.id],count:state.visible.filter(p=>patentOrganizationIds(p).has(org.id)).length}))
+  return (registry.organizations||[]).map(org=>({type:'organization',id:org.id,name:org.name,memberIds:[org.id],count:counts.get(org.id)||0}))
     .filter(item=>item.count>0).sort((a,b)=>b.count-a.count||a.name.localeCompare(b.name,'ja'));
 }
 function renderOrganizationRanking(){
   const panel=$('#organization-panel');if(!panel)return;panel.classList.toggle('hidden',state.view!=='technology');
-  const items=organizationRankingItems(),ranking=$('#organization-ranking');$('#organization-scope').textContent=`現在の表示条件 · ${state.visible.length}件`;
+  const items=organizationRankingItems(),ranking=$('#organization-ranking');$('#organization-scope').textContent=`現在の表示条件 · ${Number(state.dashboard?.aggregates?.metrics?.total||0)}件`;
   ranking.innerHTML='';if(!items.length){ranking.innerHTML=`<div class="organization-empty">${state.organizationMode==='group'?'該当する登録グループがありません':'企業名が登録された文献がありません'}</div>`;return;}
   items.forEach((item,index)=>{const button=document.createElement('button');button.className='organization-rank';button.classList.toggle('active',state.selectedOrganization?.type===item.type&&state.selectedOrganization?.id===item.id);button.dataset.agentId=`organization-rank-${slug(item.id)}`;button.title=item.name;button.innerHTML=`<span class="rank">${index+1}</span><span class="name">${escapeHtml(item.name)}</span><span class="count">${item.count}</span>`;button.addEventListener('click',()=>selectOrganization(item));ranking.append(button);});
 }
-function selectOrganization(item){state.selectedOrganization=item;clearCell();renderOrganizationRanking();renderTechnologyMap();}
-function clearOrganization(){state.selectedOrganization=null;clearCell();renderOrganizationRanking();renderTechnologyMap();}
+function selectOrganization(item){state.selectedOrganization=item;if(state.cellFilter)clearCell();else refreshDocuments(true);}
+function clearOrganization(){state.selectedOrganization=null;if(state.cellFilter)clearCell();else refreshDocuments(true);}
 function setOrganizationMode(mode){
-  if(!['organization','group'].includes(mode))return;state.organizationMode=mode;state.selectedOrganization=null;clearCell();
+  if(!['organization','group'].includes(mode))return;state.organizationMode=mode;state.selectedOrganization=null;if(state.cellFilter)clearCell();else refreshDocuments(true);
   $$('[data-organization-mode]').forEach(button=>{const active=button.dataset.organizationMode===mode;button.classList.toggle('active',active);button.setAttribute('aria-pressed',String(active));});renderOrganizationRanking();renderTechnologyMap();
 }
 
@@ -140,42 +163,35 @@ function density(count, max) {
 }
 
 function renderThreatMap() {
-  const cells = new Map();
-  state.visible.filter(p => p.analysis_state === 'ready').forEach(p => {
-    const x = Number(p.similarity), y = Number(p.concept_level);
-    if (x >= 1 && x <= 5 && y >= 1 && y <= 5) {
-      const key = `${x},${y}`; if (!cells.has(key)) cells.set(key, []); cells.get(key).push(p);
-    }
-  });
-  const max = Math.max(1,...[...cells.values()].map(v=>v.length));
+  const cells=new Map((state.dashboard?.aggregates?.threat_cells||[]).map(item=>[`${item.similarity},${item.concept_level}`,Number(item.count||0)]));
+  const max = Math.max(1,...cells.values());
   const map = $('#threat-map'); map.innerHTML = '';
   for (let y=5; y>=1; y--) for (let x=1; x<=5; x++) {
-    const patents = cells.get(`${x},${y}`) || [];
-    const button = document.createElement('button'); button.className = 'map-cell'; button.dataset.count = patents.length;
-    button.dataset.agentId = `threat-cell-${x}-${y}`; button.style.background = density(patents.length,max);
-    button.setAttribute('aria-label', `類似度${x}、概念高さ${y}、${patents.length}件`);
-    button.innerHTML = `<strong>${patents.length}</strong><small>${x} × ${y}</small>`;
+    const count = cells.get(`${x},${y}`) || 0;
+    const button = document.createElement('button'); button.className = 'map-cell'; button.dataset.count = count;
+    button.dataset.agentId = `threat-cell-${x}-${y}`; button.style.background = density(count,max);
+    button.setAttribute('aria-label', `類似度${x}、権利範囲の広さ${y}、${count}件`);
+    button.innerHTML = `<strong>${count}</strong><small>${x} × ${y}</small>`;
     if (state.cellFilter?.type === 'threat' && state.cellFilter.x === x && state.cellFilter.y === y) button.classList.add('selected');
-    button.addEventListener('click', () => selectCell({ type:'threat', x, y, patents, label:`脅威マップ：類似度 ${x} / 概念高さ ${y}` }));
+    button.addEventListener('click', () => selectCell({ type:'threat', x, y, label:`脅威マップ：類似度 ${x} / 権利範囲の広さ ${y}` }));
     map.append(button);
   }
 }
 
 function renderTechnologyMap() {
-  const ready = state.visible.filter(p => p.analysis_state === 'ready' && p.tech_cluster && p.problem_cluster);
+  const cells=state.dashboard?.aggregates?.technology_cells||[];
+  const overlayCells=state.selectedOrganization?(state.dashboard?.overlayAggregates?.technology_cells||[]):cells;
   const thresholdControl=$('#technology-cluster-min-size');const minimum=Math.max(1,Number(thresholdControl?.value||state.techClusterMinSize||1));state.techClusterMinSize=minimum;
-  const counts=values=>values.reduce((map,value)=>(map.set(value,(map.get(value)||0)+1),map),new Map());
-  const techId=p=>String(p.tech_cluster_id??p.tech_cluster),problemId=p=>String(p.problem_cluster_id??p.problem_cluster);
-  const techCounts=counts(ready.map(techId)),problemCounts=counts(ready.map(problemId));
+  const techCounts=new Map(),problemCounts=new Map(),techNames=new Map(),problemNames=new Map();
+  cells.forEach(item=>{const tech=String(item.tech_cluster_id),problem=String(item.problem_cluster_id),count=Number(item.count||0);techCounts.set(tech,(techCounts.get(tech)||0)+count);problemCounts.set(problem,(problemCounts.get(problem)||0)+count);techNames.set(tech,item.tech_cluster||tech);problemNames.set(problem,item.problem_cluster||problem);});
   const allTechs=[...techCounts.keys()],allProblems=[...problemCounts.keys()];
   const metadata=state.dashboard?.technology_map||{};
   const semanticOrder=(available,order)=>[...(order||[]).map(String).filter(id=>available.includes(id)),...available.filter(id=>!(order||[]).map(String).includes(id))];
   const techs=semanticOrder(allTechs.filter(id=>techCounts.get(id)>=minimum),metadata.technology_order);
   const problems=semanticOrder(allProblems.filter(id=>problemCounts.get(id)>=minimum),metadata.problem_order);
-  const eligible=ready.filter(p=>techCounts.get(techId(p))>=minimum&&problemCounts.get(problemId(p))>=minimum);
   const techMeta=metadata.technology_clusters||{},problemMeta=metadata.problem_clusters||{};
-  const techName=id=>techMeta[id]?.name||ready.find(p=>techId(p)===id)?.tech_cluster||id;
-  const problemName=id=>problemMeta[id]?.name||ready.find(p=>problemId(p)===id)?.problem_cluster||id;
+  const techName=id=>techMeta[id]?.name||techNames.get(id)||id;
+  const problemName=id=>problemMeta[id]?.name||problemNames.get(id)||id;
   const strength=(items,id)=>Math.max(0,Math.min(1,Number(items[id]?.relative_strength||0)));
   const map = $('#technology-map');map.innerHTML='';
   if(!techs.length||!problems.length){map.style.setProperty('--tech-cols',1);map.style.setProperty('--tech-rows',1);map.innerHTML=`<div class="map-empty"><strong>表示対象のクラスタがありません</strong><small>最小件数を下げてください</small></div>`;$('#cluster-count').textContent=`0 clusters / min ${minimum}`;$('#technology-map-note').textContent=`${minimum}件未満を非表示。技術 ${allTechs.length}・課題 ${allProblems.length}クラスタの計算結果は保持しています。`;return;}
@@ -183,19 +199,20 @@ function renderTechnologyMap() {
   map.style.gridTemplateColumns=`minmax(92px,1.1fr) repeat(${techs.length},minmax(62px,1fr))`;map.style.gridTemplateRows=`minmax(54px,auto) repeat(${problems.length},minmax(58px,1fr))`;
   const corner=document.createElement('div');corner.className='map-axis-corner';corner.textContent='課題 × 技術';map.append(corner);
   techs.forEach(id=>{const label=document.createElement('div');const glow=strength(techMeta,id);label.className='map-axis-label column';label.textContent=techName(id);label.title=`自社技術とのコサイン類似度: ${Number(techMeta[id]?.cosine_similarity||0).toFixed(3)}`;label.style.setProperty('--axis-glow',glow);map.append(label);});
-  const buckets = new Map(); eligible.forEach(p => { const k=`${techId(p)}|${problemId(p)}`; if(!buckets.has(k))buckets.set(k,[]); buckets.get(k).push(p); });
-  const max = Math.max(1,...[...buckets.values()].map(v=>v.length));
+  const buckets=new Map(cells.map(item=>[`${item.tech_cluster_id}|${item.problem_cluster_id}`,Number(item.count||0)]));
+  const overlayBuckets=new Map(overlayCells.map(item=>[`${item.tech_cluster_id}|${item.problem_cluster_id}`,Number(item.count||0)]));
+  const max = Math.max(1,...buckets.values());
   problems.forEach(problem=>{
     const rowLabel=document.createElement('div');const rowGlow=strength(problemMeta,problem);rowLabel.className='map-axis-label row';rowLabel.textContent=problemName(problem);rowLabel.title=`自社の対象課題とのコサイン類似度: ${Number(problemMeta[problem]?.cosine_similarity||0).toFixed(3)}`;rowLabel.style.setProperty('--axis-glow',rowGlow);map.append(rowLabel);
     techs.forEach(tech => {
-      const patents = buckets.get(`${tech}|${problem}`) || [];const overlayPatents=state.selectedOrganization?patents.filter(p=>organizationMatches(p)):patents; const button=document.createElement('button'); button.className='map-cell';button.dataset.count=patents.length;
-      const columnGlow=strength(techMeta,tech);button.style.background=density(patents.length,max);button.style.setProperty('--column-glow',columnGlow);button.style.setProperty('--row-glow',rowGlow);
+      const count=buckets.get(`${tech}|${problem}`)||0,overlayCount=overlayBuckets.get(`${tech}|${problem}`)||0;const button=document.createElement('button');button.className='map-cell';button.dataset.count=count;
+      const columnGlow=strength(techMeta,tech);button.style.background=density(count,max);button.style.setProperty('--column-glow',columnGlow);button.style.setProperty('--row-glow',rowGlow);
       button.dataset.agentId=`technology-cell-${slug(tech)}-${slug(problem)}`;
-      const countLabel=state.selectedOrganization?`${state.selectedOrganization.name} ${overlayPatents.length}件、母集団${patents.length}件`:`${patents.length}件`;
+      const countLabel=state.selectedOrganization?`${state.selectedOrganization.name} ${overlayCount}件、母集団${count}件`:`${count}件`;
       button.setAttribute('aria-label',`${techName(tech)}、${problemName(problem)}、${countLabel}、自社技術近接度${Math.round(columnGlow*100)}%、自社課題近接度${Math.round(rowGlow*100)}%`);button.title=`技術: ${techName(tech)}\n課題: ${problemName(problem)}\n${countLabel}\n自社技術との類似度: ${Number(techMeta[tech]?.cosine_similarity||0).toFixed(3)}\n自社課題との類似度: ${Number(problemMeta[problem]?.cosine_similarity||0).toFixed(3)}`;
-      button.innerHTML=state.selectedOrganization?`<strong class="overlay-count">${overlayPatents.length}</strong><small class="population-count">/ ${patents.length} 母集団</small>`:`<strong>${patents.length}</strong>`;
+      button.innerHTML=state.selectedOrganization?`<strong class="overlay-count">${overlayCount}</strong><small class="population-count">/ ${count} 母集団</small>`:`<strong>${count}</strong>`;
       if(state.cellFilter?.type==='technology'&&state.cellFilter.tech===tech&&state.cellFilter.problem===problem)button.classList.add('selected');
-      button.addEventListener('click',()=>selectCell({type:'technology',tech,problem,patents:overlayPatents,label:`技術：${techName(tech)} / 課題：${problemName(problem)}${state.selectedOrganization?` / ${state.selectedOrganization.name}`:''}`}));map.append(button);
+      button.addEventListener('click',()=>selectCell({type:'technology',tech,problem,label:`技術：${techName(tech)} / 課題：${problemName(problem)}${state.selectedOrganization?` / ${state.selectedOrganization.name}`:''}`}));map.append(button);
     });
   });
   const hiddenTechs=allTechs.length-techs.length,hiddenProblems=allProblems.length-problems.length;
@@ -204,15 +221,36 @@ function renderTechnologyMap() {
   $('#technology-map-note').textContent=`意味の近い順に配置。背景は母集団の文献量、左右の発光は自社技術との近さ、上下の発光は自社の対象課題との近さです。${overlayNote}${minimum}件未満を非表示（技術 ${hiddenTechs}・課題 ${hiddenProblems}）。`;
 }
 
-function selectCell(filter) { state.cellFilter = filter; $('#clear-cell').classList.remove('hidden'); $('#active-filter').classList.remove('hidden'); $('#active-filter').textContent=filter.label; renderThreatMap();renderTechnologyMap();renderPatentList(); }
-function clearCell() { state.cellFilter=null;$('#clear-cell').classList.add('hidden');$('#active-filter').classList.add('hidden');renderThreatMap();renderTechnologyMap();renderPatentList(); }
+function selectCell(filter) { state.cellFilter=filter;$('#clear-cell').classList.remove('hidden');$('#active-filter').classList.remove('hidden');$('#active-filter').textContent=filter.label;refreshDocuments(true); }
+function clearCell() { const changed=!!state.cellFilter;state.cellFilter=null;$('#clear-cell').classList.add('hidden');$('#active-filter').classList.add('hidden');if(changed)refreshDocuments(true);else{renderThreatMap();renderTechnologyMap();renderPatentList();} }
 
 function renderPatentList() {
-  const patents = state.cellFilter ? state.cellFilter.patents : state.visible; const list=$('#patent-list');list.innerHTML='';
+  const patents=state.visible;const list=$('#patent-list');list.innerHTML='';
   if(!patents.length){list.innerHTML='<div class="empty-state"><strong>該当文献はありません</strong><p>条件またはセル選択を変更してください。</p></div>';return;}
   patents.forEach(p=>{const button=document.createElement('button');button.className='patent-row';if(state.selected?.id===p.id)button.classList.add('selected');button.dataset.agentId=`patent-open-${p.id}`;
     button.innerHTML=`<span class="doc-icon">PDF</span><span><strong>${escapeHtml(p.title)}</strong><span>${escapeHtml(p.publication_number)} · ${escapeHtml(p.applicant)}</span></span><span class="row-badges"><span class="badge">${escapeHtml(displayStatus(p))}</span><span class="badge ${p.analysis_state}">${p.analysis_state}</span></span>`;
     button.addEventListener('click',()=>selectPatent(p));list.append(button);});
+}
+
+function verifiedClaimEvidence(patent){
+  const trace=patent?.claim_traceability||{};
+  return [
+    ['類似度',trace.similarity],
+    ['権利範囲の広さ',trace.concept_level],
+  ].filter(([,item])=>item?.verified===true&&Number.isInteger(item.claim_number)&&typeof item.claim_text==='string'&&item.claim_text.trim());
+}
+
+function openClaimEvidence(label,evidence){
+  $('#claim-dialog-title').textContent=`請求項${evidence.claim_number}`;
+  $('#claim-dialog-meta').textContent=`${label}の根拠 · Python検証済み · SHA-256 ${String(evidence.claim_sha256||'').slice(0,12)}…`;
+  $('#claim-dialog-text').textContent=evidence.claim_text;
+  $('#claim-dialog').showModal();
+}
+
+function renderClaimEvidence(patent){
+  const container=$('#selected-evidence'),heading=$('#selected-evidence-label'),items=verifiedClaimEvidence(patent);
+  container.innerHTML='';heading.classList.toggle('hidden',!items.length);container.classList.toggle('hidden',!items.length);
+  items.forEach(([label,evidence])=>{const button=document.createElement('button');button.type='button';button.textContent=`${label}: 請求項${evidence.claim_number}`;button.addEventListener('click',()=>openClaimEvidence(label,evidence));container.append(button);});
 }
 
 function selectPatent(patent) {
@@ -221,7 +259,7 @@ function selectPatent(patent) {
   const pendingMessage=patent.analysis_state==='skipped'?`スキップ: ${patent.skip_reason||'理由未設定'}${patent.skip_detail?` / ${patent.skip_detail}`:''}`:'ローカルLLM分析待ちです。';
   $('#selected-similarity').textContent=analysisValue(patent,'similarity')??'待機';$('#selected-concept').textContent=analysisValue(patent,'concept_level')??'待機';
   $('#selected-tech-summary').textContent=analysisValue(patent,'tech_summary')||pendingMessage;$('#selected-problem-summary').textContent=analysisValue(patent,'problem_summary')||pendingMessage;
-  $('#selected-reasoning').textContent=analysisValue(patent,'reasoning')||'スコア根拠は分析JSON生成後に表示されます。';$('#interpretation-note').value='';$('#save-feedback').textContent='';
+  $('#selected-reasoning').textContent=analysisValue(patent,'reasoning')||'スコア根拠は分析JSON生成後に表示されます。';renderClaimEvidence(patent);$('#interpretation-note').value='';$('#save-feedback').textContent='';
 }
 
 function renderInterpretation(){if(!state.selected){$('#interpretation-empty').classList.remove('hidden');$('#interpretation-content').classList.add('hidden');$('#selected-status').textContent='文献未選択';}}
@@ -263,18 +301,19 @@ async function showPipeline(){
 
 async function loadPipelineResearch(researchId){
   state.pipelineResearchId=researchId;$('#pipeline-policy').textContent='状態を確認しています…';$('#pipeline-confirm').checked=false;$('#pipeline-overwrite').checked=false;$('#pipeline-overwrite').disabled=false;
-  const id=encodeURIComponent(researchId);const [overview,preflight]=await Promise.all([api(`/api/researches/${id}/pipeline?environment=${state.environment}`),api(`/api/researches/${id}/llm-preflight?environment=${state.environment}`)]);const previous=state.pipelineJob?.id;renderPipeline(overview,preflight);const active=overview.jobs.find(job=>['running','paused','cancelling'].includes(job.status));if(active&&active.id!==previous)monitorPipelineJob(active.id,false);
+  const id=encodeURIComponent(researchId);const [overview,preflight]=await Promise.all([api(`/api/researches/${id}/pipeline?environment=${state.environment}&compact=true`),api(`/api/researches/${id}/llm-preflight?environment=${state.environment}`)]);const previous=state.pipelineJob?.id;renderPipeline(overview,preflight);const active=overview.jobs.find(job=>['running','paused','cancelling'].includes(job.status));if(active&&active.id!==previous)monitorPipelineJob(active.id,false);
 }
 
 function renderPipelineJob(job){
   const jobPanel=$('#pipeline-job');jobPanel.classList.remove('hidden');jobPanel.dataset.status=job.status;
   const progress=job.progress||{};const detail=progress.detail||{};const total=Number(detail.total||0);const completed=Number(detail.completed??(progress.stage==='completed'?total:Math.max(0,Number(detail.current||1)-1)));const percent=Number(detail.percent??(total?completed/total*100:0));
   const statusLabels={running:'実行中',paused:'一時停止',cancelling:'停止処理中',completed:'完了',failed:'バッチ停止',cancelled:'キャンセル'};$('#pipeline-job-state').textContent=statusLabels[job.status]||job.status.toUpperCase();
-  const taskLabels={similarity:'① 類似度評価',concept_level:'② 概念レベル評価',problem_summary:'③ 課題要約',technology_summary:'④ 技術要約',embeddings:'⑤ 文献Embedding',cluster_name:'クラスタ名生成'};
-  const stageLabels={initializing:'初期化',preparing:'前処理',company_profile:'自社基準の要約生成',company_embedding:'自社基準のEmbedding',analyzing:'LLM分析開始',shard_started:'永続バッチ開始',shard_completed:'永続バッチ保存・メモリ解放',loading_embeddings:'全Embedding再読込',llm_batch:taskLabels[detail.task]||'LLMバッチ処理',llm_task:taskLabels[detail.task]||'LLM処理',document_completed:'1件完了',document_failed:'1件失敗・次の文献へ継続',skipped:'スキップ・次の文献へ継続',cooldown:'冷却中',checkpoint_reused:'分析済み再利用',clustering:'クラスタリング',cluster_naming:'クラスタ名生成',semantic_ordering:'意味順・自社近接度を確定',completed:'バッチ完了',failed:'バッチ停止'};const stageLabel=stageLabels[progress.stage]||progress.stage||'待機';
-  $('#pipeline-job-progress').textContent=[stageLabel,detail.patent_id,total?`${completed}/${total}`:''].filter(Boolean).join(' · ');
+  const taskLabels={similarity:'① 類似度評価',concept_level:'② 権利範囲の広さ評価',problem_summary:'③ 課題要約',technology_summary:'④ 技術要約',embeddings:'⑤ 文献Embedding',cluster_name:'クラスタ名生成'};
+  const stageLabels={initializing:'初期化',preparing:'前処理',company_profile:'自社基準の要約生成',company_embedding:'自社基準のEmbedding',analyzing:'LLM分析開始',shard_started:'永続バッチ開始',shard_completed:'永続バッチ保存・メモリ解放',loading_embeddings:'全Embedding再読込',llm_batch:taskLabels[detail.task]||'LLMバッチ処理',llm_task:taskLabels[detail.task]||'LLM処理',rescue_queued:'高精度モデル救済待ち',rescue_started:'高精度モデル救済開始',rescue_task:taskLabels[detail.task]||'高精度モデル処理',rescue_completed:'高精度モデル救済完了',manual_review_required:'自動救済失敗・手動確認へ移行',document_completed:'1件完了',document_failed:'1件失敗・次の文献へ継続',skipped:'スキップ・次の文献へ継続',cooldown:'冷却中',checkpoint_reused:'分析済み再利用',clustering:'クラスタリング',cluster_naming:'クラスタ名生成',semantic_ordering:'意味順・近接度を確定',completed:'バッチ完了',failed:'バッチ停止'};const stageLabel=stageLabels[progress.stage]||progress.stage||'待機';
+  stageLabels.shared_cache_hit='共通LLMキャッシュ再利用';stageLabels.embedding_cache_hit='共通Embeddingキャッシュ再利用';const displayStageLabel=stageLabels[progress.stage]||stageLabel;
+  $('#pipeline-job-progress').textContent=[displayStageLabel,detail.patent_id,total?`${completed}/${total}`:''].filter(Boolean).join(' · ');
   const bar=$('#pipeline-progress-bar'),track=bar.parentElement;bar.style.width=`${Math.max(0,Math.min(100,percent))}%`;track.setAttribute('aria-valuenow',String(Math.round(percent)));
-  const cooldown=Number(detail.remaining_seconds||0);const attempt=Number(detail.attempt||0);const attemptText=attempt?` · 試行 ${attempt}/${detail.max_attempts||1}`:'';const shardText=Number(detail.shards||0)?` · バッチ ${detail.shard||1}/${detail.shards}`:'';$('#pipeline-progress-label').textContent=cooldown?`GPU冷却中 · 残り ${Math.floor(cooldown/60)}:${String(cooldown%60).padStart(2,'0')} · 処理済み ${completed}/${total}`:total?`${stageLabel}${shardText}${attemptText} · 処理済み ${completed}/${total}（${percent.toFixed(1)}%）`:`${stageLabel}${shardText}${attemptText}`;
+  const cooldown=Number(detail.remaining_seconds||0);const attempt=Number(detail.attempt||0);const attemptText=attempt?` · 試行 ${attempt}/${detail.max_attempts||1}`:'';const shardText=Number(detail.shards||0)?` · バッチ ${detail.shard||1}/${detail.shards}`:'';$('#pipeline-progress-label').textContent=cooldown?`GPU冷却中 · 残り ${Math.floor(cooldown/60)}:${String(cooldown%60).padStart(2,'0')} · 処理済み ${completed}/${total}`:total?`${displayStageLabel}${shardText}${attemptText} · 処理済み ${completed}/${total}（${percent.toFixed(1)}%）`:`${displayStageLabel}${shardText}${attemptText}`;
   const processed=Number(detail.processed??completed);const succeeded=Number(detail.succeeded??detail.llm_completed??Math.max(0,processed-Number(detail.failed||0)-Number(detail.skipped||0)));const failed=Number(detail.failed||0);const skipped=Number(detail.skipped||0);const remaining=Math.max(0,total-processed);
   $('#pipeline-live-counts').innerHTML=`<span><b>${processed}</b>処理済み</span><span><b>${succeeded}</b>成功</span><span class="failed"><b>${failed}</b>失敗</span><span><b>${skipped}</b>スキップ</span><span><b>${remaining}</b>残り</span>`;
   renderPipelineTiming(job,progress,detail,total,processed);
@@ -288,16 +327,17 @@ function renderPipelineTiming(job,progress,detail,total,processed){
   const timing=progress.timing||{};const liveDelta=job.status==='running'&&progress.updated_at?Math.max(0,(Date.now()-Date.parse(progress.updated_at))/1000):0;const elapsed=Number(timing.elapsed_seconds||0)+liveDelta;const current=Number(timing.current_phase_elapsed_seconds||0)+liveDelta;
   const taskIndex=Number(detail.task_index||0),taskFraction=total&&taskIndex?Math.max(0,Math.min(1,((taskIndex-1)+Math.max(0,Number(detail.current||0))/total)/5)):0;const documentFraction=total?processed/total:0;const fraction=Math.max(taskFraction,documentFraction);const eta=fraction>0&&fraction<1?elapsed/fraction*(1-fraction):0;
   $('#pipeline-timing-summary').innerHTML=`<span><small>総経過</small><b>${formatDuration(elapsed)}</b></span><span><small>現在工程</small><b>${formatDuration(current)}</b></span><span><small>推定残り</small><b>${eta?formatDuration(eta):'—'}</b></span>`;
-  const labels={preparation:'前処理',company_profile:'自社基準生成',company_embedding:'自社Embedding',embeddings:'文献Embedding',clustering_and_naming:'クラスタ・命名',semantic_ordering:'意味順確定',cooldown:'冷却',finalization:'結果確定',similarity:'類似度',concept_level:'概念レベル',problem_summary:'課題要約',technology_summary:'技術要約'};
+  const labels={preparation:'前処理',company_profile:'自社基準生成',company_embedding:'自社Embedding',embeddings:'文献Embedding',clustering_and_naming:'クラスタ・命名',semantic_ordering:'意味順確定',cooldown:'冷却',finalization:'結果確定',similarity:'類似度',concept_level:'権利範囲の広さ',problem_summary:'課題要約',technology_summary:'技術要約'};
   $('#pipeline-phase-times').innerHTML=Object.entries(timing.phase_durations_seconds||{}).map(([key,value])=>{const clean=key.replace('generation:','');const liveValue=Number(value)+(timing.current_phase===key?liveDelta:0);return `<span class="${timing.current_phase===key?'active':''}"><b>${escapeHtml(labels[clean]||clean)}</b><small>${formatDuration(liveValue)}</small></span>`;}).join('');
 }
 
 function renderPipelineStages(progress){
   const stage=progress.stage||'';const detail=progress.detail||{};
-  const phases=[['前処理',['initializing','preparing']],['自社基準',['company_profile']],['文献分析',['analyzing','shard_started','shard_completed','llm_batch','llm_task','document_completed','document_failed','skipped','cooldown','checkpoint_reused']],['自社Embedding',['company_embedding']],['クラスタリング',['loading_embeddings','clustering','cluster_naming']],['意味順・近接度',['semantic_ordering']],['結果確定',['completed']]];
+  const phases=[['前処理',['initializing','preparing']],['自社基準',['company_profile']],['文献分析',['analyzing','shard_started','shard_completed','llm_batch','llm_task','rescue_queued','rescue_started','rescue_task','rescue_completed','manual_review_required','document_completed','document_failed','skipped','cooldown','checkpoint_reused']],['自社Embedding',['company_embedding']],['クラスタリング',['loading_embeddings','clustering','cluster_naming']],['意味順・近接度',['semantic_ordering']],['結果確定',['completed']]];
+  phases[2][1].push('shared_cache_hit','embedding_cache_hit');
   const effectiveStage=stage==='failed'?(detail.failed_at_stage||stage):stage;const activeIndex=phases.findIndex(([,values])=>values.includes(effectiveStage));
   $('#pipeline-stages').innerHTML=phases.map(([label],index)=>`<span class="${stage==='completed'||index<activeIndex?'done':index===activeIndex?(stage==='failed'?'failed':'active'):''}">${index+1}. ${label}</span>`).join('');
-  const tasks=[['similarity','類似度'],['concept_level','概念レベル'],['problem_summary','課題要約'],['technology_summary','技術要約'],['embeddings','Embedding']];const taskIndex=Number(detail.task_index||0);const documentDone=['document_completed','cooldown'].includes(stage);const documentFailed=stage==='document_failed';
+  const tasks=[['similarity','類似度'],['concept_level','権利範囲の広さ'],['problem_summary','課題要約'],['technology_summary','技術要約'],['embeddings','Embedding']];const taskIndex=Number(detail.task_index||0);const documentDone=['document_completed','cooldown'].includes(stage);const documentFailed=stage==='document_failed';
   $('#pipeline-document-stages').innerHTML=tasks.map(([key,label],index)=>{const number=index+1;let cls=documentDone?'done':taskIndex>number?'done':taskIndex===number?'active':'';if(documentFailed&&detail.task===key)cls='failed';return `<span class="${cls}">${number}. ${label}</span>`;}).join('');
 }
 
@@ -318,8 +358,8 @@ async function monitorPipelineJob(jobId,bridgeOwned){
   }
 }
 
-async function runPipelineMode(mode){
-  const researchId=state.pipelineResearchId||state.dashboard.research.id;const source=window.PatentViewerBridge?.currentCommandId?'codex':'human';const cooldown=Math.max(0,Math.min(180,Number($('#pipeline-cooldown-seconds').value)||0));const overwrite=mode==='execute'&&$('#pipeline-overwrite').checked;const job=await api(`/api/researches/${encodeURIComponent(researchId)}/pipeline/jobs`,{method:'POST',headers:window.PatentViewerBridge?.authorizationHeaders?.()||{},body:JSON.stringify({environment:state.environment,mode,source,overwrite,confirmation:mode==='execute'?'RUN_LOCAL_LLM':undefined,cooldown_seconds:mode==='execute'?cooldown:0})});state.pipelineJob=job;renderPipelineJob(job);return monitorPipelineJob(job.id,source==='codex');
+async function runPipelineMode(mode,requested={}){
+  const researchId=requested.researchId||state.pipelineResearchId||state.dashboard.research.id;const source=window.PatentViewerBridge?.currentCommandId?'codex':'human';const selectedCooldown=Math.max(0,Math.min(180,Number($('#pipeline-cooldown-seconds').value)||0));const cooldown=requested.cooldownSeconds??selectedCooldown;const overwrite=mode==='execute'?(requested.overwrite??$('#pipeline-overwrite').checked):false;const job=await api(`/api/researches/${encodeURIComponent(researchId)}/pipeline/jobs`,{method:'POST',headers:window.PatentViewerBridge?.authorizationHeaders?.()||{},body:JSON.stringify({environment:state.environment,mode,source,overwrite,confirmation:mode==='execute'?'RUN_LOCAL_LLM':undefined,cooldown_seconds:mode==='execute'?cooldown:0})});state.pipelineJob=job;renderPipelineJob(job);return monitorPipelineJob(job.id,source==='codex');
 }
 
 function startPipeline(mode,button){
@@ -329,9 +369,17 @@ function startPipeline(mode,button){
 
 function processPending(button){
   button.patentViewerActionPromise=(async()=>{button.disabled=true;try{
-    await runPipelineMode('prepare');
+    const request={
+      researchId:state.pipelineResearchId||state.dashboard.research.id,
+      overwrite:$('#pipeline-overwrite').checked,
+      cooldownSeconds:Math.max(0,Math.min(180,Number($('#pipeline-cooldown-seconds').value)||0)),
+    };
+    await runPipelineMode('prepare',{researchId:request.researchId});
     if(!state.pipelineReady)throw new Error('前処理後もpreflightを通過できませんでした。スキップ理由を確認してください。');
-    return await runPipelineMode('execute');
+    $('#pipeline-overwrite').checked=request.overwrite;
+    $('#pipeline-confirm').checked=true;
+    updatePipelineAction();
+    return await runPipelineMode('execute',request);
   }finally{updatePipelineAction();}})();
   return button.patentViewerActionPromise;
 }
@@ -340,10 +388,10 @@ function openPipelineFrom(button){button.patentViewerActionPromise=showPipeline(
 
 function renderLegalStatusPreview(){
   const counts={rights_acquired:0,under_examination:0,published:0};
-  (state.dashboard?.patents||[]).forEach(p=>{
-    const source=String(p.source_status||'').trim();
+  (state.dashboard?.aggregates?.source_status_counts||[]).forEach(item=>{
+    const source=String(item.source_status||'').trim(),count=Number(item.count||0);
     const category=state.legalStatusDraft.rights_acquired.includes(source)?'rights_acquired':state.legalStatusDraft.under_examination.includes(source)?'under_examination':'published';
-    counts[category]++;
+    counts[category]+=count;
   });
   $('#legal-status-preview').innerHTML=[
     ['権利化',counts.rights_acquired],['審査中',counts.under_examination],['公開',counts.published],
@@ -445,7 +493,7 @@ async function setResearchArchived(archived){
 }
 
 function organizationCounts(){
-  const counts=new Map();state.dashboard.patents.forEach(p=>(p.applicant_organization_ids||[]).forEach(id=>counts.set(id,(counts.get(id)||0)+1)));return counts;
+  return new Map((organizationRegistry().organizations||[]).map(item=>[item.id,Number(item.document_count||0)]));
 }
 function resetOrganizationGroupForm(){
   state.editingOrganizationGroup=null;$('#organization-group-form').reset();$('#organization-group-id').value='';$('#organization-group-scope').disabled=false;$('#organization-group-delete').classList.add('hidden');$('#organization-group-feedback').textContent='';renderOrganizationGroupManager();
@@ -511,6 +559,7 @@ function bindEvents(){
   initSidebarResizer();
   $('#research-select').addEventListener('change',e=>loadDashboard(e.target.value));$('#year-from').addEventListener('change',event=>changeYearRange(event.target));$('#year-to').addEventListener('change',event=>changeYearRange(event.target));$('#search-input').addEventListener('input',applyFilters);$$('#legal-status-filters input').forEach(x=>x.addEventListener('change',applyFilters));
   $('#reset-filters').addEventListener('click',resetFilters);$('#clear-cell').addEventListener('click',clearCell);$('#preview-selected').addEventListener('click',()=>{if(state.selected?.pdf_available)openPdf(state.selected);});$('#pdf-close').addEventListener('click',()=>{$('#pdf-frame').src='about:blank';$('#pdf-dialog').close();});$('#save-note').addEventListener('click',saveNote);$('#debug-toggle').addEventListener('click',toggleEnvironment);$('#preflight-button').addEventListener('click',showPreflight);
+  $('#patent-list').addEventListener('scroll',event=>{const list=event.currentTarget;if(list.scrollTop+list.clientHeight>=list.scrollHeight-120)loadMoreDocuments();});
   $('#technology-cluster-min-size').addEventListener('change',event=>{state.techClusterMinSize=Math.max(1,Number(event.target.value)||1);if(state.cellFilter?.type==='technology')clearCell();else renderTechnologyMap();});
   $$('[data-organization-mode]').forEach(button=>button.addEventListener('click',()=>setOrganizationMode(button.dataset.organizationMode)));$('#organization-clear').addEventListener('click',clearOrganization);$('#organization-groups-manage').addEventListener('click',showOrganizationGroups);$('#organization-group-new').addEventListener('click',resetOrganizationGroupForm);$('#organization-group-form').addEventListener('submit',saveOrganizationGroup);$('#organization-group-delete').addEventListener('click',deleteOrganizationGroup);
   $('#pipeline-button').addEventListener('click',()=>openPipelineFrom($('#pipeline-button')));$('#pipeline-refresh').addEventListener('click',()=>loadPipelineResearch(state.pipelineResearchId));$('#pipeline-research-select').addEventListener('change',event=>loadPipelineResearch(event.target.value));$('#pipeline-confirm').addEventListener('change',updatePipelineAction);$('#pipeline-overwrite').addEventListener('change',()=>{$('#pipeline-confirm').checked=false;updatePipelineAction();});$('#pipeline-prepare').addEventListener('click',()=>startPipeline('prepare',$('#pipeline-prepare')));$('#pipeline-execute').addEventListener('click',()=>processPending($('#pipeline-execute')));$('#pipeline-pause').addEventListener('click',()=>controlPipeline('pause'));$('#pipeline-resume').addEventListener('click',()=>controlPipeline('run'));$('#pipeline-cancel').addEventListener('click',()=>controlPipeline('cancel'));

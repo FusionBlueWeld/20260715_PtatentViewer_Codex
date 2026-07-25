@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import concurrent.futures
 import json
 import math
@@ -16,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from patent_viewer.domain import DataError, patent_key
+from patent_viewer.domain import DataError, patent_key, read_json
 from patent_viewer.pipeline import (
     ANALYSIS_PIPELINE_VERSION,
     DocumentSkipped,
@@ -67,6 +68,54 @@ DOCUMENT_TASK_INDEX = {
     "problem_summary": 3,
     "technology_summary": 4,
 }
+TASK_EVIDENCE_FIELDS = {
+    "similarity": "evidence_element_ids",
+    "concept_level": "evidence_element_ids",
+    "problem_summary": "source_paragraph_ids",
+    "technology_summary": "source_ids",
+}
+
+
+def constrained_stage_schema(
+    task: str,
+    constraints: dict | None,
+) -> dict:
+    """Return a task schema narrowed to candidates present in this input only."""
+    schema = copy.deepcopy(STAGE_SCHEMAS[task])
+    if not isinstance(constraints, dict):
+        return schema
+
+    evidence_field = TASK_EVIDENCE_FIELDS.get(task)
+    allowed_evidence_ids = constraints.get("allowed_evidence_ids")
+    if evidence_field and isinstance(allowed_evidence_ids, list):
+        allowed_evidence_ids = list(dict.fromkeys(
+            item for item in allowed_evidence_ids
+            if isinstance(item, str) and item
+        ))
+        if not allowed_evidence_ids:
+            raise ValueError(f"{task} has no allowed evidence IDs")
+        field_schema = schema["properties"][evidence_field]
+        field_schema["items"]["enum"] = allowed_evidence_ids
+        if "maxItems" in field_schema:
+            field_schema["maxItems"] = min(
+                field_schema["maxItems"],
+                len(allowed_evidence_ids),
+            )
+
+    allowed_claim_numbers = constraints.get("allowed_claim_numbers")
+    if (
+        task in {"similarity", "concept_level"}
+        and isinstance(allowed_claim_numbers, list)
+    ):
+        allowed_claim_numbers = list(dict.fromkeys(
+            item for item in allowed_claim_numbers
+            if type(item) is int
+        ))
+        if not allowed_claim_numbers:
+            raise ValueError(f"{task} has no allowed claim numbers")
+        schema["properties"]["claim_number"]["enum"] = allowed_claim_numbers
+
+    return schema
 
 
 def validate_schema_value(value, schema: dict, path: str = "$") -> None:
@@ -86,6 +135,23 @@ def validate_schema_value(value, schema: dict, path: str = "$") -> None:
         for key, item in value.items():
             if key in properties:
                 validate_schema_value(item, properties[key], f"{path}.{key}")
+        return
+    if expected == "array":
+        if not isinstance(value, list):
+            raise ValueError(f"{path} must be an array")
+        if len(value) < schema.get("minItems", 0):
+            raise ValueError(f"{path} has too few items")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            raise ValueError(f"{path} has too many items")
+        if schema.get("uniqueItems") and len({
+            json.dumps(item, ensure_ascii=False, sort_keys=True)
+            for item in value
+        }) != len(value):
+            raise ValueError(f"{path} must contain unique items")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                validate_schema_value(item, item_schema, f"{path}[{index}]")
         return
     if expected == "string":
         if not isinstance(value, str):
@@ -107,6 +173,8 @@ def extraction_index_entry(root: Path, pdf_name: str, prepared: dict) -> dict:
     cache_dir = prepared["cache_dir"]
     artifact_dir = prepared["artifact_dir"]
     manifest = json.loads((cache_dir / "extraction_manifest.json").read_text(encoding="utf-8"))
+    shared = prepared.get("shared_preprocessing", {})
+    shared_manifest = shared.get("manifest", {})
     return {
         "patent_id": patent_key(pdf_name),
         "pdf": pdf_name,
@@ -120,7 +188,13 @@ def extraction_index_entry(root: Path, pdf_name: str, prepared: dict) -> dict:
         "extracted_text": str((cache_dir / "extracted_text.txt").relative_to(root)),
         "pages_json": str((cache_dir / "pages.json").relative_to(root)),
         "extraction_manifest": str((cache_dir / "extraction_manifest.json").relative_to(root)),
-        "document_structure": str((artifact_dir / "document_structure.json").relative_to(root)),
+        "shared_preprocessing_cache_decision": shared.get("cache_decision"),
+        "shared_preprocessing_version": shared_manifest.get("preprocessing_version"),
+        "preprocessing_manifest": str((cache_dir / "preprocessing_manifest.json").relative_to(root)),
+        "document_structure": str((cache_dir / "document_structure.json").relative_to(root)),
+        "structured_document": str((cache_dir / "structured_document.json").relative_to(root)),
+        "claim_structure": str((cache_dir / "claim_structure.json").relative_to(root)),
+        "evidence_pack": str((artifact_dir / "evidence_pack.json").relative_to(root)),
         "source_decision": str((artifact_dir / "source_decision.json").relative_to(root)),
     }
 
@@ -165,7 +239,18 @@ def write_progress_event(path: Path, payload: dict) -> bool:
 
 
 class OllamaStages:
-    def __init__(self, model: str, embedding_model: str, timeout: int, checkpoint=lambda: None, progress=lambda stage, **detail: None, ollama_url: str = "http://127.0.0.1:11434", keep_alive: str = "1h"):
+    def __init__(
+        self,
+        model: str,
+        embedding_model: str,
+        timeout: int,
+        checkpoint=lambda: None,
+        progress=lambda stage, **detail: None,
+        ollama_url: str = "http://127.0.0.1:11434",
+        keep_alive: str = "1h",
+        use_native_schema: bool = True,
+        output_token_scale: int = 1,
+    ):
         self.model = model
         self.embedding_model = embedding_model
         self.timeout = timeout
@@ -175,6 +260,8 @@ class OllamaStages:
         self.progress = progress
         self.ollama_url = ollama_url.rstrip("/")
         self.keep_alive = keep_alive
+        self.use_native_schema = use_native_schema
+        self.output_token_scale = max(1, output_token_scale)
         self._audit_lock = threading.Lock()
         self._audit_counters: dict[str, int] = {}
 
@@ -193,10 +280,44 @@ class OllamaStages:
             raise RuntimeError(f"Ollama {endpoint}: {result['error']}")
         return result
 
+    def task_cache_identity(self, task: str) -> dict:
+        prompt_path = (
+            ROOT
+            / "src/patent_viewer/prompts/stages"
+            / f"{task}.txt"
+        )
+        return {
+            "model": self.model,
+            "prompt_sha256": sha256_bytes(prompt_path.read_bytes()),
+            "schema_sha256": sha256_bytes(
+                json.dumps(
+                    STAGE_SCHEMAS[task],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ),
+            "temperature": 0,
+            "top_p": 0.9,
+            "use_native_schema": self.use_native_schema,
+            "output_token_limits": [
+                value * self.output_token_scale
+                for value in TASK_OUTPUT_TOKENS[task]
+            ],
+        }
+
+    def embedding_cache_identity(self) -> dict:
+        return {
+            "model": self.embedding_model,
+            "num_ctx": 4096,
+            "input_order": ["technology", "problem"],
+        }
+
     def generate_json(self, task: str, data: dict, audit_dir: Path | None = None) -> dict:
         self.checkpoint()
         template = (ROOT / "src/patent_viewer/prompts/stages" / f"{task}.txt").read_text(encoding="utf-8")
-        schema = STAGE_SCHEMAS[task]
+        grounding_constraints = data.get("grounding_constraints")
+        schema = constrained_stage_schema(task, grounding_constraints)
         if task == "company_profile":
             input_text = f"## 自社技術定義\n{data['company_technology']}"
         elif task == "similarity":
@@ -217,10 +338,39 @@ class OllamaStages:
             f"{template}\n\n## 出力JSON Schema\n{json.dumps(schema, ensure_ascii=False)}"
             f"\n\n{input_text}"
         )
+        if isinstance(grounding_constraints, dict):
+            enforcement = (
+                "the JSON Schema decoder and Python validation"
+                if self.use_native_schema
+                else "Python validation after generation"
+            )
+            base_prompt += (
+                "\n\n## Strict grounding constraints\n"
+                "Use only the following candidate values. These values are also "
+                f"enforced by {enforcement}; do not invent or copy any other ID "
+                "or claim number. Return only the JSON object with no markdown "
+                "or explanation outside it.\n"
+                f"{json.dumps(grounding_constraints, ensure_ascii=False)}"
+            )
+        grounding_repair = data.get("grounding_repair")
+        if isinstance(grounding_repair, dict):
+            allowed_ids = grounding_repair.get("allowed_ids", [])
+            base_prompt += (
+                "\n\n## Python検証による根拠ID再生成\n"
+                "前回の根拠IDはPython検証に適合しませんでした。"
+                "スコアまたは要約を再確認し、根拠IDには次の候補だけを"
+                "そのまま使用してください。\n"
+                f"{json.dumps(allowed_ids, ensure_ascii=False)}\n"
+                "候補が内容を支えない場合も、候補外のIDを新しく作らず、"
+                "入力本文と候補から最も直接的な根拠を選んでください。"
+            )
         selected_audit = audit_dir or self.audit_dir
         audit = selected_audit / "llm_calls" if selected_audit else None
         last_error = "unknown error"
-        token_limits = TASK_OUTPUT_TOKENS[task]
+        token_limits = tuple(
+            value * self.output_token_scale
+            for value in TASK_OUTPUT_TOKENS[task]
+        )
         for attempt, num_predict in enumerate(token_limits, 1):
             self.checkpoint()
             retry_note = (
@@ -230,9 +380,11 @@ class OllamaStages:
             prompt = base_prompt + retry_note
             num_ctx = context_window_for(prompt, num_predict)
             payload = {
-                "model": self.model, "prompt": prompt, "stream": False, "format": schema, "keep_alive": self.keep_alive,
+                "model": self.model, "prompt": prompt, "stream": False, "keep_alive": self.keep_alive,
                 "options": {"temperature": 0, "top_p": 0.9, "num_ctx": num_ctx, "num_predict": num_predict},
             }
+            if self.use_native_schema:
+                payload["format"] = schema
             if task == "cluster_name":
                 self.progress(
                     "cluster_naming", task=task, attempt=attempt,
@@ -257,6 +409,11 @@ class OllamaStages:
             if audit:
                 atomic_json(audit / f"{call_number:03d}-{task}-request.json", {
                     "task": task, "attempt": attempt, "model": self.model,
+                    "schema_enforcement": (
+                        "native_and_python"
+                        if self.use_native_schema
+                        else "prompt_and_python"
+                    ),
                     "prompt_sha256": sha256_bytes(prompt.encode("utf-8")),
                     "prompt_characters": len(prompt), "num_ctx": num_ctx, "num_predict": num_predict, "input": data,
                 })
@@ -314,6 +471,7 @@ def main() -> int:
     parser.add_argument("--environment", choices=("normal", "debug"), default="normal")
     parser.add_argument("--stage", choices=("prepare", "plan", "execute"), default="prepare")
     parser.add_argument("--generation-model", default="gemma4:e4b")
+    parser.add_argument("--rescue-model", default="gpt-oss:20b")
     parser.add_argument("--embedding-model", default="qwen3-embedding:8b")
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--generation-workers", type=int, default=1)
@@ -422,6 +580,7 @@ def main() -> int:
             remaining -= 1
 
     model = None
+    rescue_model = None
     try:
         emit("initializing", mode=args.stage, research_id=args.research_id)
         pipeline = ResearchPipeline(ROOT, args.environment, args.research_id)
@@ -442,6 +601,9 @@ def main() -> int:
         work_items: list[dict] = []
         extraction_entries: list[dict] = []
         document_failures: list[dict] = []
+        primary_failures: list[dict] = []
+        manual_review_failures: list[dict] = []
+        rescue_queue: list[dict] = []
         document_skips: list[dict] = []
         if args.stage == "plan":
             for pdf_path, patent in pipeline.patents():
@@ -457,14 +619,20 @@ def main() -> int:
             patents = pipeline.patents()
             if args.limit is not None:
                 patents = patents[:args.limit]
+            if len(patents) > 1_000:
+                args.durable_shards = True
             pending_total = sum(
-                not pipeline.existing_result_path(pdf_path.name).exists() or args.overwrite
+                (
+                    not pipeline.manual_review_required(pdf_path.name)
+                    and (not pipeline.result_exists(pdf_path.name) or args.overwrite)
+                )
                 for pdf_path, _ in patents
                 if pdf_path.is_file()
             ) if args.stage == "execute" else len(patents)
             llm_total = sum(
-                (args.overwrite or not pipeline.existing_result_path(pdf_path.name).exists())
+                (args.overwrite or not pipeline.result_exists(pdf_path.name))
                 and (args.overwrite or not pipeline.analysis_checkpoint_current(pdf_path.name))
+                and not pipeline.manual_review_required(pdf_path.name)
                 for pdf_path, _ in patents if pdf_path.is_file()
             ) if args.stage == "execute" else 0
             llm_completed = 0
@@ -475,7 +643,29 @@ def main() -> int:
                 checkpoint()
                 key = patent_key(pdf_path.name)
                 final_path = pipeline.existing_result_path(pdf_path.name)
-                if args.stage == "execute" and final_path.exists() and not args.overwrite:
+                if (
+                    args.stage == "execute"
+                    and pipeline.manual_review_required(pdf_path.name)
+                ):
+                    skip = read_json(
+                        pipeline.artifact_dir(pdf_path.name) / "skip.json"
+                    )
+                    documents.append({
+                        "patent_id": key,
+                        "pdf": pdf_path.name,
+                        "analysis_state": "skipped",
+                        **skip,
+                    })
+                    document_skips.append(skip)
+                    emit(
+                        "skipped",
+                        patent_id=key,
+                        reason=skip["reason"],
+                        current=pending_index,
+                        total=pending_total,
+                    )
+                    continue
+                if args.stage == "execute" and pipeline.result_exists(pdf_path.name) and not args.overwrite:
                     if pending_total:
                         if not args.durable_shards:
                             existing_analyses[key] = pipeline.load_analysis_artifacts(pdf_path.name)
@@ -509,6 +699,7 @@ def main() -> int:
                         "skipped_at": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
                     }
                     atomic_json(pipeline.artifact_dir(pdf_path.name) / "skip.json", skip)
+                    pipeline.persist_status_artifact(pdf_path.name, "skip", skip)
                     documents.append({"patent_id": key, "pdf": pdf_path.name, "analysis_state": "skipped", **skip})
                     document_skips.append(skip)
                     emit("skipped", patent_id=key, reason=skip["reason"], current=progress_index, total=pending_total)
@@ -522,6 +713,7 @@ def main() -> int:
                         "skipped_at": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
                     }
                     atomic_json(pipeline.artifact_dir(pdf_path.name) / "skip.json", skip)
+                    pipeline.persist_status_artifact(pdf_path.name, "skip", skip)
                     documents.append({"patent_id": key, "pdf": pdf_path.name, "analysis_state": "skipped", **skip})
                     document_skips.append(skip)
                     emit("skipped", patent_id=key, reason=exc.reason, current=progress_index, total=pending_total)
@@ -545,6 +737,7 @@ def main() -> int:
                         "retry_on_next_run": True,
                     }
                     atomic_json(pipeline.artifact_dir(pdf_path.name) / "analysis_error.json", failure)
+                    pipeline.persist_status_artifact(pdf_path.name, "analysis_error", failure)
                     documents.append({
                         "patent_id": key, "pdf": pdf_path.name,
                         "analysis_state": "failed", "analysis_error": failure,
@@ -587,6 +780,106 @@ def main() -> int:
         if args.stage == "execute" and work_items:
             llm_attempted = len(work_items)
             task_order = ("concept_level", "problem_summary", "similarity", "technology_summary")
+
+            def failure_payload(
+                item: dict,
+                exc: Exception,
+                task: str,
+                *,
+                phase: str,
+                retry_on_next_run: bool,
+                audit_dir: Path | None = None,
+            ) -> dict:
+                selected_audit = audit_dir or item["audit_dir"]
+                return {
+                    "schema_version": 1,
+                    "pipeline_version": ANALYSIS_PIPELINE_VERSION,
+                    "run_id": run_id,
+                    "patent_id": item["key"],
+                    "pdf": item["pdf_path"].name,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "failed_stage": getattr(exc, "task", task),
+                    "attempts": getattr(exc, "attempts", 1),
+                    "failure_phase": phase,
+                    "primary_model": args.generation_model,
+                    "rescue_model": args.rescue_model,
+                    "audit_dir": str(selected_audit.relative_to(ROOT)),
+                    "completed_artifacts": sorted(
+                        path.name
+                        for path in item["prepared"]["artifact_dir"].glob("*.json")
+                        if path.name not in {
+                            "analysis_error.json",
+                            "analysis_complete.json",
+                        }
+                    ),
+                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                    "retry_on_next_run": retry_on_next_run,
+                }
+
+            def record_terminal_skip(
+                item: dict,
+                exc: Exception,
+                task: str,
+                *,
+                phase: str,
+                audit_dir: Path | None = None,
+            ) -> None:
+                failure = failure_payload(
+                    item,
+                    exc,
+                    task,
+                    phase=phase,
+                    retry_on_next_run=False,
+                    audit_dir=audit_dir,
+                )
+                failure["manual_review_required"] = True
+                error_path = item["prepared"]["artifact_dir"] / "analysis_error.json"
+                atomic_json(error_path, failure)
+                pipeline.persist_status_artifact(
+                    item["pdf_path"].name, "analysis_error", failure
+                )
+                skip = {
+                    "schema_version": 1,
+                    "pipeline_version": ANALYSIS_PIPELINE_VERSION,
+                    "run_id": run_id,
+                    "patent_id": item["key"],
+                    "pdf": item["pdf_path"].name,
+                    "reason": "manual_review_required",
+                    "detail": (
+                        f"{task} failed after the {phase} phase: {exc}. "
+                        "Excluded from analysis totals; ask Codex to review manually."
+                    ),
+                    "failed_stage": task,
+                    "primary_model": args.generation_model,
+                    "rescue_model": args.rescue_model,
+                    "analysis_error": failure,
+                    "skipped_at": datetime.now(timezone.utc).isoformat(),
+                }
+                atomic_json(item["prepared"]["artifact_dir"] / "skip.json", skip)
+                pipeline.persist_status_artifact(
+                    item["pdf_path"].name, "skip", skip
+                )
+                item["record"].update({
+                    "analysis_state": "skipped",
+                    "skip_reason": skip["reason"],
+                    "skip_detail": skip["detail"],
+                    "analysis_error": failure,
+                })
+                manual_review_failures.append(failure)
+                document_skips.append(skip)
+                emit(
+                    "manual_review_required",
+                    patent_id=item["key"],
+                    error=str(exc),
+                    task=task,
+                    failed=len(document_failures),
+                    manual_review=len(manual_review_failures),
+                    skipped=len(document_skips),
+                    current=llm_completed + len(document_skips),
+                    total=pending_total,
+                )
+
             calls_per_cooling_period = max(1, min(args.shard_size, args.cooldown_every_documents * len(task_order)))
             shards = (
                 [work_items]
@@ -606,30 +899,32 @@ def main() -> int:
                 shard_analyses: dict[str, dict] = {}
 
                 def record_failure(item: dict, exc: Exception, task: str) -> None:
-                    failure = {
-                        "schema_version": 1, "pipeline_version": ANALYSIS_PIPELINE_VERSION,
-                        "run_id": run_id, "patent_id": item["key"], "pdf": item["pdf_path"].name,
-                        "error_type": type(exc).__name__, "error": str(exc),
-                        "failed_stage": getattr(exc, "task", task),
-                        "attempts": getattr(exc, "attempts", 1),
-                        "audit_dir": str(item["audit_dir"].relative_to(ROOT)),
-                        "completed_artifacts": sorted(
-                            path.name for path in item["prepared"]["artifact_dir"].glob("*.json")
-                            if path.name not in {"analysis_error.json", "analysis_complete.json"}
-                        ),
-                        "failed_at": datetime.now(timezone.utc).isoformat(), "retry_on_next_run": True,
-                    }
+                    failure = failure_payload(
+                        item,
+                        exc,
+                        task,
+                        phase="primary",
+                        retry_on_next_run=True,
+                    )
+                    failure["rescue_pending"] = True
                     atomic_json(item["prepared"]["artifact_dir"] / "analysis_error.json", failure)
-                    item["record"].update({"analysis_state": "failed", "analysis_error": failure})
-                    document_failures.append(failure)
+                    pipeline.persist_status_artifact(item["pdf_path"].name, "analysis_error", failure)
+                    item["record"].update({"analysis_state": "rescue_pending", "analysis_error": failure})
+                    primary_failures.append(failure)
+                    rescue_queue.append({
+                        "item": item,
+                        "failed_task": task,
+                        "primary_failure": failure,
+                    })
                     active.pop(item["key"], None)
                     emit(
-                        "document_failed", patent_id=item["key"], error=str(exc),
+                        "rescue_queued", patent_id=item["key"], error=str(exc),
                         task=task, task_index=DOCUMENT_TASK_INDEX.get(task, 5), task_total=5,
-                        completed=llm_completed + len(document_failures), processed=llm_completed,
-                        succeeded=llm_completed, failed=len(document_failures), skipped=len(document_skips),
-                        current=llm_completed + len(document_failures), total=pending_total,
-                        percent=round((llm_completed + len(document_failures)) / max(1, pending_total) * 100, 1),
+                        completed=llm_completed + len(primary_failures), processed=llm_completed,
+                        succeeded=llm_completed, rescue_pending=len(rescue_queue),
+                        failed=len(document_failures), skipped=len(document_skips),
+                        current=llm_completed + len(primary_failures), total=pending_total,
+                        percent=round((llm_completed + len(primary_failures)) / max(1, pending_total) * 100, 1),
                     )
 
                 # In legacy mode this loop still sees one shard containing every work item.
@@ -659,10 +954,27 @@ def main() -> int:
                         )
 
                         def run_task(item: dict) -> dict:
-                            return pipeline.analyze_task(
+                            result = pipeline.analyze_task(
                                 item["prepared"], task,
                                 lambda name, data: model.generate_json(name, data, audit_dir=item["audit_dir"]),
+                                cache_identity=model.task_cache_identity(task),
                             )
+                            cache_status = (
+                                pipeline.analysis_cache_summary(
+                                    item["prepared"]
+                                )
+                                .get("tasks", {})
+                                .get(task, {})
+                            )
+                            if cache_status.get("hit") is True:
+                                emit(
+                                    "shared_cache_hit",
+                                    patent_id=item["key"],
+                                    task=task,
+                                    task_index=DOCUMENT_TASK_INDEX[task],
+                                    task_total=5,
+                                )
+                            return result
 
                         with concurrent.futures.ThreadPoolExecutor(max_workers=args.generation_workers) as executor:
                             futures = {executor.submit(run_task, item): item for item in group if item["key"] in active}
@@ -680,9 +992,30 @@ def main() -> int:
                 model.unload_generation()
                 embedding_items = list(active.values())
                 documents_per_embedding_batch = max(1, args.embedding_batch_size // 2)
+                embedding_cache_identity = model.embedding_cache_identity()
                 for offset in range(0, len(embedding_items), documents_per_embedding_batch):
                     checkpoint()
                     group = [item for item in embedding_items[offset:offset + documents_per_embedding_batch] if item["key"] in active]
+                    if not group:
+                        continue
+                    uncached_group = []
+                    for item in group:
+                        cached_analysis = pipeline.reuse_shared_embedding(
+                            item["prepared"],
+                            embedding_cache_identity,
+                        )
+                        if cached_analysis is not None:
+                            shard_analyses[item["key"]] = cached_analysis
+                            emit(
+                                "embedding_cache_hit",
+                                patent_id=item["key"],
+                                task="embeddings",
+                                current=llm_completed + offset,
+                                total=pending_total,
+                            )
+                        else:
+                            uncached_group.append(item)
+                    group = uncached_group
                     if not group:
                         continue
                     flat_inputs: list[str] = []
@@ -702,7 +1035,9 @@ def main() -> int:
                             raise ValueError(f"expected {len(flat_inputs)} embeddings, got {len(vectors)}")
                         for index, item in enumerate(group):
                             shard_analyses[item["key"]] = pipeline.write_embedding(
-                                item["prepared"], vectors[index * 2:index * 2 + 2],
+                                item["prepared"],
+                                vectors[index * 2:index * 2 + 2],
+                                cache_identity=embedding_cache_identity,
                             )
                     except PipelineCancelled:
                         raise
@@ -711,9 +1046,19 @@ def main() -> int:
                             try:
                                 generated = pipeline.assemble_generated_analysis(item["prepared"])
                                 inputs = [generated["summaries"]["tech_summary"], generated["summaries"]["problem_summary"]]
-                                shard_analyses[item["key"]] = pipeline.write_embedding(item["prepared"], model.embed(inputs))
+                                shard_analyses[item["key"]] = pipeline.write_embedding(
+                                    item["prepared"],
+                                    model.embed(inputs),
+                                    cache_identity=embedding_cache_identity,
+                                )
                             except (DocumentAnalysisError, ValueError, RuntimeError, OSError) as exc:
-                                record_failure(item, exc, "embeddings")
+                                record_terminal_skip(
+                                    item,
+                                    exc,
+                                    "embeddings",
+                                    phase="embedding",
+                                )
+                                active.pop(item["key"], None)
 
                 for item in shard_items:
                     if item["key"] not in shard_analyses:
@@ -723,11 +1068,17 @@ def main() -> int:
                     if error_path.exists():
                         error_path.unlink()
                     item["record"]["analysis_state"] = "analyzed"
-                    atomic_json(item["prepared"]["artifact_dir"] / "analysis_complete.json", {
+                    completion = {
                         "schema_version": 1, "patent_id": item["key"],
                         "pdf_sha256": item["prepared"]["source_decision"]["pdf_sha256"],
                         "pipeline_version": ANALYSIS_PIPELINE_VERSION, "run_id": run_id,
-                        "generation_model": args.generation_model, "embedding_model": args.embedding_model,
+                        "generation_model": args.generation_model,
+                        "rescue_model": args.rescue_model,
+                        "rescued": False,
+                        "embedding_model": args.embedding_model,
+                        "shared_cache": pipeline.analysis_cache_summary(
+                            item["prepared"]
+                        ),
                         "audit_dir": str(item["audit_dir"].relative_to(ROOT)),
                         "runtime": {
                             "generation_workers": args.generation_workers,
@@ -736,7 +1087,18 @@ def main() -> int:
                             "keep_alive": args.keep_alive,
                         },
                         "completed_at": datetime.now(timezone.utc).isoformat(),
-                    })
+                    }
+                    atomic_json(item["prepared"]["artifact_dir"] / "analysis_complete.json", completion)
+                    pipeline.store.put_artifact(
+                        pipeline.research_id,
+                        item["key"],
+                        "analysis_complete",
+                        completion,
+                        run_id=run_id,
+                        source_path=str(
+                            (item["prepared"]["artifact_dir"] / "analysis_complete.json").relative_to(ROOT)
+                        ),
+                    )
                     emit(
                         "document_completed", patent_id=item["key"], completed=llm_completed,
                         processed=llm_completed, succeeded=llm_completed, failed=len(document_failures),
@@ -746,8 +1108,12 @@ def main() -> int:
                     )
                 if args.durable_shards:
                     model.unload_embedding()
+                    rescue_keys = {
+                        entry["item"]["key"] for entry in rescue_queue
+                    }
                     for item in shard_items:
-                        item["prepared"] = None
+                        if item["key"] not in rescue_keys:
+                            item["prepared"] = None
                     shard_analyses.clear()
                     active.clear()
                     emit(
@@ -757,6 +1123,227 @@ def main() -> int:
                     )
                 else:
                     analyses.update(shard_analyses)
+
+            if rescue_queue:
+                model.unload_generation()
+                model.unload_embedding()
+                rescue_model = OllamaStages(
+                    args.rescue_model,
+                    args.embedding_model,
+                    args.timeout,
+                    checkpoint,
+                    model_progress,
+                    ollama_url=args.ollama_url,
+                    keep_alive=args.keep_alive,
+                    use_native_schema=False,
+                    output_token_scale=2,
+                )
+                emit(
+                    "rescue_started",
+                    model=args.rescue_model,
+                    documents=len(rescue_queue),
+                    current=llm_completed,
+                    total=pending_total,
+                )
+                rescue_successes: list[dict] = []
+                for rescue_index, entry in enumerate(rescue_queue, 1):
+                    checkpoint()
+                    item = entry["item"]
+                    rescue_audit_dir = (
+                        item["prepared"]["artifact_dir"]
+                        / "attempts"
+                        / run_id
+                        / "rescue"
+                    )
+                    item["rescue_audit_dir"] = rescue_audit_dir
+                    item["rescued_tasks"] = []
+                    try:
+                        for task in task_order:
+                            if pipeline.analysis_task_current(
+                                item["prepared"], task
+                            ):
+                                continue
+                            emit(
+                                "rescue_task",
+                                patent_id=item["key"],
+                                model=args.rescue_model,
+                                task=task,
+                                task_index=DOCUMENT_TASK_INDEX[task],
+                                task_total=5,
+                                rescue_current=rescue_index,
+                                rescue_total=len(rescue_queue),
+                                current=llm_completed,
+                                total=pending_total,
+                            )
+                            pipeline.analyze_task(
+                                item["prepared"],
+                                task,
+                                lambda name, data, selected=item: (
+                                    rescue_model.generate_json(
+                                        name,
+                                        data,
+                                        audit_dir=selected["rescue_audit_dir"],
+                                    )
+                                ),
+                                cache_identity=(
+                                    rescue_model.task_cache_identity(task)
+                                ),
+                            )
+                            cache_status = (
+                                pipeline.analysis_cache_summary(
+                                    item["prepared"]
+                                )
+                                .get("tasks", {})
+                                .get(task, {})
+                            )
+                            if cache_status.get("hit") is True:
+                                emit(
+                                    "shared_cache_hit",
+                                    patent_id=item["key"],
+                                    task=task,
+                                    rescue=True,
+                                    rescue_current=rescue_index,
+                                    rescue_total=len(rescue_queue),
+                                )
+                            item["rescued_tasks"].append(task)
+                        rescue_successes.append(item)
+                    except PipelineCancelled:
+                        raise
+                    except (
+                        DocumentAnalysisError,
+                        ValueError,
+                        RuntimeError,
+                        OSError,
+                    ) as exc:
+                        record_terminal_skip(
+                            item,
+                            exc,
+                            getattr(exc, "task", entry["failed_task"]),
+                            phase="rescue",
+                            audit_dir=rescue_audit_dir,
+                        )
+
+                rescue_model.unload_generation()
+                rescue_embedding_identity = (
+                    rescue_model.embedding_cache_identity()
+                )
+                for item in rescue_successes:
+                    checkpoint()
+                    try:
+                        analysis = pipeline.reuse_shared_embedding(
+                            item["prepared"],
+                            rescue_embedding_identity,
+                        )
+                        if analysis is None:
+                            generated = (
+                                pipeline.assemble_generated_analysis(
+                                    item["prepared"]
+                                )
+                            )
+                            inputs = [
+                                generated["summaries"]["tech_summary"],
+                                generated["summaries"]["problem_summary"],
+                            ]
+                            analysis = pipeline.write_embedding(
+                                item["prepared"],
+                                rescue_model.embed(inputs),
+                                cache_identity=rescue_embedding_identity,
+                            )
+                    except PipelineCancelled:
+                        raise
+                    except (
+                        DocumentAnalysisError,
+                        ValueError,
+                        RuntimeError,
+                        OSError,
+                    ) as exc:
+                        record_terminal_skip(
+                            item,
+                            exc,
+                            "embeddings",
+                            phase="rescue_embedding",
+                            audit_dir=item["rescue_audit_dir"],
+                        )
+                        continue
+
+                    llm_completed += 1
+                    error_path = (
+                        item["prepared"]["artifact_dir"]
+                        / "analysis_error.json"
+                    )
+                    if error_path.exists():
+                        error_path.unlink()
+                    skip_path = item["prepared"]["artifact_dir"] / "skip.json"
+                    if skip_path.exists():
+                        skip_path.unlink()
+                    item["record"].update({
+                        "analysis_state": "analyzed",
+                        "rescued": True,
+                        "rescued_tasks": item["rescued_tasks"],
+                    })
+                    item["record"].pop("analysis_error", None)
+                    completion = {
+                        "schema_version": 1,
+                        "patent_id": item["key"],
+                        "pdf_sha256": item["prepared"]["source_decision"][
+                            "pdf_sha256"
+                        ],
+                        "pipeline_version": ANALYSIS_PIPELINE_VERSION,
+                        "run_id": run_id,
+                        "generation_model": args.generation_model,
+                        "rescue_model": args.rescue_model,
+                        "rescue_schema_enforcement": "prompt_and_python",
+                        "rescued": True,
+                        "rescued_tasks": item["rescued_tasks"],
+                        "embedding_model": args.embedding_model,
+                        "shared_cache": pipeline.analysis_cache_summary(
+                            item["prepared"]
+                        ),
+                        "audit_dir": str(
+                            item["rescue_audit_dir"].relative_to(ROOT)
+                        ),
+                        "runtime": {
+                            "generation_workers": 1,
+                            "embedding_batch_size": 1,
+                            "shard_size": args.shard_size,
+                            "durable_shards": args.durable_shards,
+                            "keep_alive": args.keep_alive,
+                        },
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    atomic_json(
+                        item["prepared"]["artifact_dir"]
+                        / "analysis_complete.json",
+                        completion,
+                    )
+                    pipeline.store.put_artifact(
+                        pipeline.research_id,
+                        item["key"],
+                        "analysis_complete",
+                        completion,
+                        run_id=run_id,
+                        source_path=str(
+                            (
+                                item["prepared"]["artifact_dir"]
+                                / "analysis_complete.json"
+                            ).relative_to(ROOT)
+                        ),
+                    )
+                    if not args.durable_shards:
+                        analyses[item["key"]] = analysis
+                    emit(
+                        "rescue_completed",
+                        patent_id=item["key"],
+                        model=args.rescue_model,
+                        rescued_tasks=item["rescued_tasks"],
+                        succeeded=llm_completed,
+                        failed=len(document_failures),
+                        manual_review=len(manual_review_failures),
+                        skipped=len(document_skips),
+                        current=llm_completed + len(document_skips),
+                        total=pending_total,
+                    )
+                rescue_model.unload_embedding()
 
             if company_profile:
                 emit("company_embedding", current=pending_total, total=pending_total, percent=100)
@@ -777,21 +1364,10 @@ def main() -> int:
                 checkpoint()
                 processed_count = llm_completed
                 if args.durable_shards:
-                    analyses = {}
-                    failed_keys = {item["patent_id"] for item in document_failures}
                     emit(
                         "loading_embeddings", documents=len(patents), processed=processed_count,
                         current=pending_total, total=pending_total, percent=100,
                     )
-                    for pdf_path, _ in patents:
-                        key = patent_key(pdf_path.name)
-                        if key in failed_keys:
-                            continue
-                        if (
-                            pipeline.analysis_checkpoint_current(pdf_path.name)
-                            or pipeline.existing_result_path(pdf_path.name).exists()
-                        ):
-                            analyses[key] = pipeline.load_analysis_artifacts(pdf_path.name)
                 else:
                     analyses = {**existing_analyses, **analyses}
                 progress_context.clear()
@@ -800,18 +1376,24 @@ def main() -> int:
                     "failed": len(document_failures), "skipped": len(document_skips),
                     "current": pending_total, "total": pending_total, "percent": 100,
                 })
-                emit("clustering", documents=len(analyses), processed=processed_count, completed=pending_total, current=pending_total, total=pending_total, percent=100)
+                finalize_count = len(patents) if args.durable_shards else len(analyses)
+                emit("clustering", documents=finalize_count, processed=processed_count, completed=pending_total, current=pending_total, total=pending_total, percent=100)
                 model.audit_dir = pipeline.research_dir / "clustering" / run_id
                 model.counter = 0
-                finalized = pipeline.finalize_research(
-                    analyses, model.generate_json, run_id, args.cluster_count, company_reference,
-                    lambda stage, **detail: emit(
-                        stage, **progress_context, **detail,
-                    ),
-                )
+                if args.durable_shards:
+                    finalized = pipeline.finalize_persisted_research(
+                        model.generate_json, run_id, args.cluster_count, company_reference,
+                        lambda stage, **detail: emit(stage, **progress_context, **detail),
+                    )
+                else:
+                    finalized = pipeline.finalize_research(
+                        analyses, model.generate_json, run_id, args.cluster_count, company_reference,
+                        lambda stage, **detail: emit(stage, **progress_context, **detail),
+                    )
                 finalized["processed"] = processed_count
                 finalized["failed"] = len(document_failures)
-                pipeline.mark_analysis_current()
+                if not document_failures:
+                    pipeline.mark_analysis_current()
                 finalized["failed_documents"] = [item["patent_id"] for item in document_failures]
             else:
                 finalized = {
@@ -827,6 +1409,8 @@ def main() -> int:
             {
                 "documents": documents,
                 "document_failures": document_failures,
+                "primary_failures": primary_failures,
+                "manual_review_failures": manual_review_failures,
                 "document_skips": document_skips,
                 "extraction_indexes": [str(path.relative_to(ROOT)) for path in extraction_indexes],
                 "llm_execution": (
@@ -836,6 +1420,9 @@ def main() -> int:
                 "runtime": {
                     "ollama_url": args.ollama_url,
                     "generation_workers": args.generation_workers,
+                    "generation_model": args.generation_model,
+                    "rescue_model": args.rescue_model,
+                    "rescue_schema_enforcement": "prompt_and_python",
                     "embedding_batch_size": args.embedding_batch_size,
                     "shard_size": args.shard_size,
                     "durable_shards": args.durable_shards,
@@ -861,6 +1448,8 @@ def main() -> int:
             "pipeline_stages": PIPELINE_STAGES,
             "documents": documents,
             "document_failures": document_failures,
+            "primary_failures": primary_failures,
+            "manual_review_failures": manual_review_failures,
             "document_skips": document_skips,
             "extraction_indexes": [str(path.relative_to(ROOT)) for path in extraction_indexes],
             "outputs": finalized,
@@ -871,6 +1460,9 @@ def main() -> int:
         if model is not None:
             model.unload_generation()
             model.unload_embedding()
+        if rescue_model is not None:
+            rescue_model.unload_generation()
+            rescue_model.unload_embedding()
         previous = dict(last_progress)
         failure_detail = dict(previous.get("detail", {}))
         failure_detail.update({"error": str(exc), "failed_at_stage": previous.get("stage", "")})

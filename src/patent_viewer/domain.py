@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .storage import SQLiteStore
+
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 ANALYSIS_REQUIRED = {"similarity", "concept_level", "tech_summary", "problem_summary", "reasoning", "tech_cluster", "problem_cluster"}
@@ -360,6 +362,13 @@ class DataPaths:
 class Repository:
     def __init__(self, root: Path):
         self.root = root.resolve()
+        self._stores: dict[str, SQLiteStore] = {}
+
+    def store(self, environment: str) -> SQLiteStore:
+        self.paths(environment)
+        if environment not in self._stores:
+            self._stores[environment] = SQLiteStore(self.root, environment)
+        return self._stores[environment]
 
     def paths(self, environment: str) -> DataPaths:
         if environment not in {"normal", "debug"}:
@@ -479,6 +488,7 @@ class Repository:
         finally:
             if draft.exists():
                 shutil.rmtree(draft)
+        self.sync_research(environment, research_id, force=True)
         return {
             "ok": True, "research_id": research_id, "active_csv": filename,
             "document_count": len(patents), "validation": audit,
@@ -520,6 +530,7 @@ class Repository:
             config["schema_version"] = max(2, int(config.get("schema_version", 0)))
             config["lifecycle"] = lifecycle
             write_json_atomic(research_dir / "research.json", config)
+            self.sync_research(environment, research_id, force=True)
         return {
             "ok": True, "research_id": research_id,
             "active_csv": new_active.name if new_active else None,
@@ -551,6 +562,7 @@ class Repository:
         config["schema_version"] = max(2, int(config.get("schema_version", 0)))
         config["lifecycle"] = lifecycle
         write_json_atomic(research_dir / "research.json", config)
+        self.sync_research(environment, research_id, force=True)
         return {"ok": True, "research_id": research_id, "lifecycle": self._lifecycle(config)}
 
     def save_legal_status_rules(self, environment: str, research_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -580,6 +592,7 @@ class Repository:
         lifecycle["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
         config["lifecycle"] = lifecycle
         write_json_atomic(research_dir / "research.json", config)
+        self.sync_research(environment, research_id, force=True)
         return {"ok": True, "research_id": research_id, "legal_status_rules": rules}
 
     def _organization_registry_path(self, environment: str) -> Path:
@@ -680,50 +693,85 @@ class Repository:
         write_json_atomic(target, {"version": 1, "updated_at": updated_at, "groups": persisted})
         return {"ok": True, "scope": scope, "group": saved, "path": str(target.relative_to(self.root))}
 
-    def list_researches(self, environment: str, status: str = "active") -> list[dict[str, Any]]:
-        if status not in {"active", "archived", "all"}:
-            raise DataError("リサーチ状態の指定が不正です")
-        base = self.paths(environment).researches
-        items: list[dict[str, Any]] = []
-        if not base.exists():
-            return items
-        for research_dir in sorted(path for path in base.iterdir() if path.is_dir()):
-            if not (
-                (research_dir / "research.json").exists()
-                or (research_dir / "company_tech.txt").exists()
-                or (research_dir / "patents.json").exists()
-                or latest_patent_list(research_dir)[0]
-            ):
-                continue
-            config = read_research_config(research_dir)
-            lifecycle = self._lifecycle(config)
-            if status != "all" and lifecycle["status"] != status:
-                continue
-            company_technology = read_company_technology(research_dir, config)
-            research_id = safe_id(research_dir.name, "research id")
-            patents, input_audit = research_patents(research_dir, self.paths(environment).pool)
-            items.append({
-                "id": research_id,
-                "name": config.get("name", research_id),
-                "description": config.get("description", ""),
-                "company_technology": company_technology,
-                "document_count": len(patents),
-                "input": input_audit,
-                "lifecycle": lifecycle,
-                "csv_history": self._csv_history(research_dir),
-            })
-        return items
+    def _research_signature(self, environment: str, research_dir: Path) -> str:
+        """Cheap invalidation key for filesystem compatibility inputs.
 
-    def dashboard(self, environment: str, research_id: str) -> dict[str, Any]:
+        The PDF directory mtime changes when files are added or removed, while
+        source and configuration files are content hashed. Generated analysis
+        is written directly to SQLite by the current pipeline; legacy JSON is
+        imported by the explicit migration command.
+        """
+        digest = hashlib.sha256()
+        for path in (
+            research_dir / "research.json",
+            research_dir / "company_tech.txt",
+            research_dir / "patents.json",
+            latest_patent_list(research_dir)[0],
+        ):
+            if path and path.is_file():
+                digest.update(path.name.encode("utf-8"))
+                digest.update(path.read_bytes())
+        pool = self.paths(environment).pool
+        try:
+            digest.update(str(pool.stat().st_mtime_ns).encode("ascii"))
+        except OSError:
+            digest.update(b"missing-pool")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _technology_map(research_dir: Path) -> dict[str, Any]:
+        clustering_root = research_dir / "clustering"
+        if not clustering_root.is_dir():
+            return {}
+        for run_dir in sorted((item for item in clustering_root.iterdir() if item.is_dir()), reverse=True):
+            clusters_path = run_dir / "clusters.json"
+            if not clusters_path.is_file():
+                continue
+            clusters = read_json(clusters_path)
+            ordering = clusters.get("semantic_ordering", {})
+            proximity = clusters.get("company_proximity", {})
+            technology_names = clusters.get("technology_cluster_names", {})
+            problem_names = clusters.get("problem_cluster_names", {})
+
+            def metadata(names: dict, values: dict) -> dict[str, Any]:
+                return {
+                    str(cluster_id): {
+                        "name": name,
+                        **values.get(str(cluster_id), values.get(cluster_id, {})),
+                    }
+                    for cluster_id, name in names.items()
+                }
+
+            return {
+                "run_id": run_dir.name,
+                "algorithm": ordering.get("algorithm"),
+                "proximity_scale": proximity.get("scale"),
+                "technology_order": [str(item) for item in ordering.get("technology_order", [])],
+                "problem_order": [str(item) for item in ordering.get("problem_order", [])],
+                "technology_clusters": metadata(technology_names, proximity.get("technology", {})),
+                "problem_clusters": metadata(problem_names, proximity.get("problem", {})),
+            }
+        return {}
+
+    def _filesystem_documents(
+        self,
+        environment: str,
+        research_dir: Path,
+        config: dict[str, Any],
+        *,
+        prefer_database_results: bool = True,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, str]]:
         paths = self.paths(environment)
-        research_id = safe_id(research_id, "research id")
-        research_dir = (paths.researches / research_id).resolve()
-        if research_dir.parent != paths.researches.resolve() or not research_dir.is_dir():
-            raise DataError("リサーチが見つかりません")
-        config = read_research_config(research_dir)
-        company_technology = read_company_technology(research_dir, config)
         status_rules = legal_status_rules(config)
-        patents: list[dict[str, Any]] = []
+        research_id = safe_id(research_dir.name, "research id")
+        existing = {}
+        if prefer_database_results and self.store(environment).source_signature(research_id):
+            existing = {
+                str(item.get("id")): item
+                for item in self.store(environment).all_documents(research_id)
+            }
+        documents: list[dict[str, Any]] = []
+        organizations: dict[str, str] = {}
         seen: set[str] = set()
         research_documents, input_audit = research_patents(research_dir, paths.pool)
         for raw in research_documents:
@@ -733,33 +781,41 @@ class Repository:
             pdf_path = (paths.pool / pdf_name).resolve()
             if pdf_path.parent != paths.pool.resolve():
                 raise DataError(f"不正なPDF参照です: {pdf_name}")
-            pdf_available = pdf_path.is_file()
             key = patent_key(pdf_name)
             if key in seen:
                 raise DataError(f"同一リサーチ内でPDFが重複しています: {pdf_name}")
             seen.add(key)
-            analysis_path = research_dir / "results" / f"{key}.json"
             legacy_id = raw.get("_legacy_subresearch_id")
-            legacy_analysis_path = research_dir / "subresearches" / str(legacy_id) / "results" / f"{key}.json"
-            if not analysis_path.exists() and legacy_id and legacy_analysis_path.exists():
-                analysis_path = legacy_analysis_path
-            analysis = read_json(analysis_path) if analysis_path.exists() else {}
+            result_path = research_dir / "results" / f"{key}.json"
+            legacy_result = research_dir / "subresearches" / str(legacy_id) / "results" / f"{key}.json"
+            if not result_path.exists() and legacy_id and legacy_result.exists():
+                result_path = legacy_result
+            analysis = read_json(result_path) if result_path.exists() else {
+                field: existing.get(key, {}).get(field)
+                for field in ANALYSIS_REQUIRED | {"tech_cluster_id", "problem_cluster_id"}
+                if existing.get(key, {}).get(field) is not None
+            }
             skip_path = research_dir / "pipeline" / key / "skip.json"
-            legacy_skip_path = research_dir / "subresearches" / str(legacy_id) / "pipeline" / key / "skip.json"
-            if not skip_path.exists() and legacy_id and legacy_skip_path.exists():
-                skip_path = legacy_skip_path
+            legacy_skip = research_dir / "subresearches" / str(legacy_id) / "pipeline" / key / "skip.json"
+            if not skip_path.exists() and legacy_id and legacy_skip.exists():
+                skip_path = legacy_skip
             skip = read_json(skip_path) if skip_path.exists() else {}
+            pdf_available = pdf_path.is_file()
             if not pdf_available:
                 skip = {"reason": "pdf_not_found", "detail": f"PDFがpatent_poolにありません: {pdf_name}"}
             publication_number = str(raw.get("publication_number") or Path(pdf_name).stem)
             source_status = raw.get("source_status")
             derived_application_year = application_year(raw.get("application_date"))
+            entities = applicant_organizations(raw.get("applicant"))
+            organizations.update({item["id"]: item["name"] for item in entities})
             record = {
                 "id": key,
                 "pdf": pdf_name,
                 "publication_number": publication_number,
                 "title": raw.get("title") or publication_number,
                 "applicant": raw.get("applicant", "未設定"),
+                "applicant_organizations": entities,
+                "applicant_organization_ids": [item["id"] for item in entities],
                 "category": raw.get("category", "未分類"),
                 "year": derived_application_year or raw.get("year") or infer_year(publication_number),
                 "year_source": "application_date" if derived_application_year else str(raw.get("year_source") or "legacy"),
@@ -780,40 +836,173 @@ class Repository:
                 "pdf_match": raw.get("pdf_match"),
             }
             record.update(analysis)
-            patents.append(record)
-        technology_map: dict[str, Any] = {}
-        clustering_root = research_dir / "clustering"
-        if clustering_root.is_dir():
-            for run_dir in sorted((item for item in clustering_root.iterdir() if item.is_dir()), reverse=True):
-                clusters_path = run_dir / "clusters.json"
-                if not clusters_path.is_file():
+            documents.append(record)
+        return documents, input_audit, organizations
+
+    def _import_artifacts(self, environment: str, research_id: str, research_dir: Path) -> int:
+        store = self.store(environment)
+        imported = 0
+        roots = [research_dir / "pipeline", research_dir / "subresearches"]
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in root.rglob("*.json"):
+                if path.name == "embeddings.json":
+                    try:
+                        embedding = read_json(path)
+                        patent_id = path.parent.name
+                        store.put_embedding(research_id, patent_id, embedding)
+                        imported += 1
+                    except (DataError, KeyError, ValueError):
+                        continue
                     continue
-                clusters = read_json(clusters_path)
-                ordering = clusters.get("semantic_ordering", {})
-                proximity = clusters.get("company_proximity", {})
-                technology_names = clusters.get("technology_cluster_names", {})
-                problem_names = clusters.get("problem_cluster_names", {})
+                try:
+                    payload = read_json(path)
+                except DataError:
+                    continue
+                relative = path.relative_to(research_dir)
+                patent_id = path.parent.name if SAFE_ID.fullmatch(path.parent.name) else "_research"
+                run_id = ""
+                parts = relative.parts
+                if "attempts" in parts:
+                    index = parts.index("attempts")
+                    if index + 1 < len(parts):
+                        run_id = parts[index + 1]
+                store.put_artifact(
+                    research_id,
+                    patent_id,
+                    path.stem,
+                    payload,
+                    run_id=run_id,
+                    source_path=str(relative),
+                )
+                imported += 1
+        interpretations = self.paths(environment).runtime / "interpretations" / research_id
+        if interpretations.is_dir():
+            for path in interpretations.glob("*.json"):
+                try:
+                    payload = read_json(path)
+                    store.save_interpretation(
+                        research_id,
+                        safe_id(path.stem, "patent id"),
+                        str(payload.get("note", "")),
+                        str(payload.get("source", "human")),
+                    )
+                    imported += 1
+                except (DataError, ValueError):
+                    continue
+        return imported
 
-                def cluster_metadata(names: dict, values: dict) -> dict[str, Any]:
-                    return {
-                        str(cluster_id): {
-                            "name": name,
-                            **values.get(str(cluster_id), values.get(cluster_id, {})),
-                        }
-                        for cluster_id, name in names.items()
-                    }
+    def sync_research(
+        self,
+        environment: str,
+        research_id: str,
+        *,
+        force: bool = False,
+        import_artifacts: bool = False,
+    ) -> dict[str, Any]:
+        paths = self.paths(environment)
+        research_id = safe_id(research_id, "research id")
+        research_dir = (paths.researches / research_id).resolve()
+        if research_dir.parent != paths.researches.resolve() or not research_dir.is_dir():
+            raise DataError("リサーチが見つかりません")
+        signature = self._research_signature(environment, research_dir)
+        store = self.store(environment)
+        changed = force or store.source_signature(research_id) != signature
+        if changed:
+            config = read_research_config(research_dir)
+            company_technology = read_company_technology(research_dir, config)
+            documents, input_audit, organizations = self._filesystem_documents(
+                environment, research_dir, config, prefer_database_results=True
+            )
+            store.replace_research(
+                research_id,
+                config=config,
+                company_technology=company_technology,
+                input_audit=input_audit,
+                csv_history=self._csv_history(research_dir),
+                technology_map=self._technology_map(research_dir),
+                source_signature=signature,
+                documents=documents,
+                organizations=organizations,
+            )
+        imported = self._import_artifacts(environment, research_id, research_dir) if import_artifacts else 0
+        return {"research_id": research_id, "changed": changed, "artifacts_imported": imported}
 
-                technology_map = {
-                    "run_id": run_dir.name,
-                    "algorithm": ordering.get("algorithm"),
-                    "proximity_scale": proximity.get("scale"),
-                    "technology_order": [str(item) for item in ordering.get("technology_order", [])],
-                    "problem_order": [str(item) for item in ordering.get("problem_order", [])],
-                    "technology_clusters": cluster_metadata(technology_names, proximity.get("technology", {})),
-                    "problem_clusters": cluster_metadata(problem_names, proximity.get("problem", {})),
-                }
-                break
-        organization_registry = self.organization_registry(environment, research_id, patents)
+    def sync_environment(
+        self, environment: str, *, force: bool = False, import_artifacts: bool = False
+    ) -> dict[str, Any]:
+        paths = self.paths(environment)
+        paths.researches.mkdir(parents=True, exist_ok=True)
+        items = []
+        for research_dir in sorted(path for path in paths.researches.iterdir() if path.is_dir()):
+            if not (
+                (research_dir / "research.json").exists()
+                or (research_dir / "company_tech.txt").exists()
+                or (research_dir / "patents.json").exists()
+                or latest_patent_list(research_dir)[0]
+            ):
+                continue
+            items.append(
+                self.sync_research(
+                    environment,
+                    research_dir.name,
+                    force=force,
+                    import_artifacts=import_artifacts,
+                )
+            )
+        store = self.store(environment)
+        pool_signature = (
+            str(paths.pool.stat().st_mtime_ns) if paths.pool.exists() else "missing"
+        )
+        if force or store.get_metadata("pool_signature") != pool_signature:
+            pool_count = (
+                sum(1 for _ in paths.pool.glob("*.pdf")) if paths.pool.exists() else 0
+            )
+            store.set_metadata("pool_count", str(pool_count))
+            store.set_metadata("pool_signature", pool_signature)
+        else:
+            pool_count = store.pool_count()
+        return {
+            "environment": environment,
+            "researches": items,
+            "pool_count": pool_count,
+            "database": store.statistics(),
+        }
+
+    def list_researches(self, environment: str, status: str = "active") -> list[dict[str, Any]]:
+        if status not in {"active", "archived", "all"}:
+            raise DataError("リサーチ状態の指定が不正です")
+        self.sync_environment(environment)
+        return self.store(environment).list_researches(status)
+
+    def _stored_organization_registry(self, environment: str, research_id: str) -> dict[str, Any]:
+        shared, shared_version = self._read_groups(self._organization_registry_path(environment), "common")
+        local, local_version = self._read_groups(self._research_organization_path(environment, research_id), "research")
+        version_material = f"{shared_version or 'none'}|{local_version or 'none'}"
+        return {
+            "version": hashlib.sha256(version_material.encode("utf-8")).hexdigest()[:12],
+            "organizations": self.store(environment).organizations(research_id),
+            "groups": shared + local,
+        }
+
+    def dashboard(
+        self, environment: str, research_id: str, *, include_patents: bool = True
+    ) -> dict[str, Any]:
+        paths = self.paths(environment)
+        research_id = safe_id(research_id, "research id")
+        research_dir = (paths.researches / research_id).resolve()
+        if research_dir.parent != paths.researches.resolve() or not research_dir.is_dir():
+            raise DataError("リサーチが見つかりません")
+        self.sync_research(environment, research_id)
+        stored = self.store(environment).research(research_id)
+        if not stored:
+            raise DataError("リサーチDBを初期化できません")
+        config = stored["config"]
+        company_technology = stored["company_technology"]
+        status_rules = legal_status_rules(config)
+        page = self.store(environment).document_page(research_id, limit=1)
+        patents = self.store(environment).all_documents(research_id) if include_patents else []
         return {
             "environment": environment,
             "research": {
@@ -825,12 +1014,17 @@ class Repository:
                 "lifecycle": self._lifecycle(config),
                 "csv_history": self._csv_history(research_dir),
             },
-            "pool_count": len(list(paths.pool.glob("*.pdf"))),
-            "input": input_audit,
-            "technology_map": technology_map,
-            "organization_registry": organization_registry,
+            "pool_count": self.store(environment).pool_count(),
+            "input": stored["input"],
+            "technology_map": stored["technology_map"],
+            "organization_registry": self._stored_organization_registry(environment, research_id),
+            "aggregates": page["aggregates"],
             "patents": patents,
         }
+
+    def document_page(self, environment: str, research_id: str, **filters: Any) -> dict[str, Any]:
+        self.sync_research(environment, research_id)
+        return self.store(environment).document_page(research_id, **filters)
 
     def pdf_path(self, pdf_name: str) -> Path:
         if Path(pdf_name).name != pdf_name or not pdf_name.lower().endswith(".pdf"):
@@ -858,10 +1052,13 @@ class Repository:
             "source": payload.get("source", "human"),
         }
         target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.store(environment).save_interpretation(
+            research_id, patent_id, note, str(payload.get("source", "human"))
+        )
         return target
 
     def preflight(self, environment: str, research_id: str, ollama_url: str = "http://127.0.0.1:11434") -> dict[str, Any]:
-        dashboard = self.dashboard(environment, research_id)
+        dashboard = self.dashboard(environment, research_id, include_patents=False)
         paths = self.paths(environment)
         research_dir = paths.researches / safe_id(research_id, "research id")
         required_prompt_names = {
@@ -907,7 +1104,12 @@ class Repository:
         structure_missing = 0
         structure_invalid = 0
         structure_skipped = 0
-        for patent in dashboard["patents"]:
+        selection_fingerprint = hashlib.sha256()
+        document_count = 0
+        for patent in self.store(environment).iter_documents(research_id):
+            document_count += 1
+            selection_fingerprint.update(str(patent.get("pdf", "")).encode("utf-8"))
+            selection_fingerprint.update(b"\n")
             if not patent.get("pdf_available"):
                 continue
             artifact_dir = research_dir / "pipeline" / patent["id"]
@@ -932,12 +1134,15 @@ class Repository:
                 structure_invalid += 1
         structure_ok = structure_total > 0 and structure_valid == structure_total
         checks = [
-            {"id": "pdf-selection", "ok": bool(dashboard["patents"]), "detail": f"{len(dashboard['patents'])}件"},
+            {"id": "pdf-selection", "ok": document_count > 0, "detail": f"{document_count}件"},
             {"id": "prompts", "ok": prompt_contract_ok, "detail": f"小型プロンプト {len(required_prompt_names & installed_prompt_names)}/{len(required_prompt_names)}・Schema {len(required_schema_names & installed_schema_names)}/{len(required_schema_names)}"},
             {"id": "output-isolation", "ok": self.paths(environment).runtime != self.paths("debug" if environment == "normal" else "normal").runtime, "detail": str(self.paths(environment).runtime)},
             {"id": "ollama", "ok": ollama_ok, "detail": ollama_detail},
             {"id": "models", "ok": models_ok, "detail": "必要モデル導入済み" if models_ok else f"不足: {', '.join(missing_models)}"},
             {"id": "claim-structure", "ok": structure_ok, "detail": f"有効 {structure_valid}/{structure_total}件・未準備 {structure_missing}件・異常 {structure_invalid}件・スキップ {structure_skipped}件"},
         ]
-        fingerprint = hashlib.sha256("\n".join(p["pdf"] for p in dashboard["patents"]).encode()).hexdigest()[:12]
-        return {"ready": all(c["ok"] for c in checks), "checks": checks, "selection_fingerprint": fingerprint}
+        return {
+            "ready": all(c["ok"] for c in checks),
+            "checks": checks,
+            "selection_fingerprint": selection_fingerprint.hexdigest()[:12],
+        }

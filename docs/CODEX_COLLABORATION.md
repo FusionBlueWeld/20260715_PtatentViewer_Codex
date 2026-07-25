@@ -26,6 +26,11 @@ python tools/patent_viewer.py doctor
 
 The MCP server reads `runtime/server-control.json`, so it automatically follows the port and per-process token selected by the local PatentViewer instance. No device-specific path or token is committed.
 
+For a production device that starts with new PDFs and an empty data store, follow
+[`PRODUCTION_BOOTSTRAP.md`](PRODUCTION_BOOTSTRAP.md). That procedure explicitly
+forbids copying development PDFs, databases, analysis results, and runtime
+artifacts to production.
+
 For UI-only work that must not start the managed Ollama process:
 
 ```powershell

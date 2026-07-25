@@ -33,7 +33,15 @@ ANALYSIS_SCHEMA = {
     "required": sorted(ANALYSIS_REQUIRED),
     "properties": {
         "similarity": {"type": "integer", "minimum": 1, "maximum": 5},
-        "concept_level": {"type": "integer", "minimum": 1, "maximum": 5},
+        "concept_level": {
+            "description": (
+                "独立請求項の文言上の権利範囲の広さ。"
+                "1は非常に狭く、5は非常に広い。"
+            ),
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+        },
         "tech_summary": {"type": "string", "minLength": 1, "maxLength": 2000},
         "problem_summary": {"type": "string", "minLength": 1, "maxLength": 2000},
         "reasoning": {"type": "string", "minLength": 1, "maxLength": 4000},

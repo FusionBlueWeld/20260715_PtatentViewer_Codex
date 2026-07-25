@@ -88,26 +88,34 @@ class PatentViewerClient:
         self, research_id: str, *, query: str = "", states: list[str] | None = None,
         analysis_states: list[str] | None = None, environment: str | None = None,
     ) -> dict[str, Any]:
-        dashboard = self.dashboard(research_id, environment)
-        needle = query.casefold().strip()
-        legal = set(states or [])
-        analysis = set(analysis_states or [])
-        items = []
-        for patent in dashboard.get("patents", []):
-            haystack = " ".join(str(patent.get(key, "")) for key in ("id", "publication_number", "title", "applicant")).casefold()
-            if needle and needle not in haystack:
-                continue
-            if legal and patent.get("legal_status_category") not in legal:
-                continue
-            if analysis and patent.get("analysis_state") not in analysis:
-                continue
-            items.append({
-                key: patent.get(key) for key in (
+        parameters = {
+            "limit": 500,
+            **({"environment": environment} if environment else {}),
+            **({"q": query} if query else {}),
+            **({"status": ",".join(states)} if states else {}),
+            **({"analysis_state": ",".join(analysis_states)} if analysis_states else {}),
+        }
+        result = self.request(
+            f"/api/researches/{quote(research_id)}/documents?{urlencode(parameters)}"
+        )
+        items = [
+            {
+                key: patent.get(key)
+                for key in (
                     "id", "publication_number", "title", "applicant", "year",
                     "legal_status_category", "analysis_state", "pdf_available", "skip_reason",
                 )
-            })
-        return {"research_id": research_id, "count": len(items), "items": items, "execution_path": "rule_api"}
+            }
+            for patent in result.get("items", [])
+        ]
+        return {
+            "research_id": research_id,
+            "count": result.get("total", len(items)),
+            "items": items,
+            "has_more": result.get("has_more", False),
+            "execution_path": "rule_api",
+            "storage": "sqlite_query",
+        }
 
     def blocks(self) -> dict[str, Any]:
         return self.request("/api/collaboration/blocks")

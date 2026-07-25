@@ -26,6 +26,9 @@
     ]
   },
   "lifecycle": {
-    "updated_at": "2026-07-24T17:58:50+09:00"
+    "updated_at": "2026-07-25T13:52:03.318912+00:00",
+    "analysis_stale": false,
+    "status": "active",
+    "created_at": "2026-07-25T04:27:58.596616+00:00"
   }
 }

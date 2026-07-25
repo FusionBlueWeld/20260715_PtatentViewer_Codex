@@ -87,14 +87,14 @@
         <article class="metric"><span>表示文献</span><strong id="metric-visible">0</strong><small id="metric-total">/ 0 total</small></article>
         <article class="metric"><span>分析済み</span><strong id="metric-ready">0</strong><small>pendingは評価から除外</small></article>
         <article class="metric"><span>権利化比率</span><strong id="metric-registered">0%</strong><div class="mini-progress"><i id="registered-bar"></i></div></article>
-        <article class="metric accent"><span>高脅威候補</span><strong id="metric-threat">0</strong><small>類似度4+ / 概念高さ4+</small></article>
+        <article class="metric accent"><span>高脅威候補</span><strong id="metric-threat">0</strong><small>類似度4+ / 権利範囲の広さ4+</small></article>
       </section>
 
       <section class="map-grid single-map">
         <article class="panel map-panel" id="threat-panel">
           <header class="panel-head"><div><p class="eyebrow">SIMILARITY × SCOPE</p><h2>脅威マップ</h2></div><span class="legend"><i></i>件数密度</span></header>
           <div class="axis-layout">
-            <span class="y-axis">概念高さ →</span>
+            <span class="y-axis">権利範囲の広さ →</span>
             <div id="threat-map" class="map threat-map" role="grid" aria-label="脅威マップ"></div>
             <span class="x-axis">自社技術との類似度 →</span>
           </div>
@@ -125,8 +125,8 @@
           <div id="interpretation-content" class="hidden">
             <h3 id="selected-title"></h3>
             <p id="selected-number" class="muted"></p>
-            <div class="score-row"><span>類似度 <b id="selected-similarity">—</b></span><span>概念高さ <b id="selected-concept">—</b></span></div>
-            <dl class="summary-list"><dt>技術要約</dt><dd id="selected-tech-summary"></dd><dt>課題要約</dt><dd id="selected-problem-summary"></dd><dt>評価の読み方</dt><dd id="selected-reasoning"></dd></dl>
+            <div class="score-row"><span>類似度 <b id="selected-similarity">—</b></span><span>権利範囲の広さ <b id="selected-concept">—</b></span></div>
+            <dl class="summary-list"><dt>技術要約</dt><dd id="selected-tech-summary"></dd><dt>課題要約</dt><dd id="selected-problem-summary"></dd><dt>評価の読み方</dt><dd id="selected-reasoning"></dd><dt id="selected-evidence-label" class="hidden">原文トレース</dt><dd id="selected-evidence" class="claim-evidence hidden"></dd></dl>
             <label for="interpretation-note">調査メモ / Codex解釈</label>
             <textarea id="interpretation-note" rows="5" data-agent-id="interpretation-note" placeholder="比較観点、権利範囲、次に確認する請求項など"></textarea>
             <div class="button-row"><button id="save-note" class="primary" data-agent-id="interpretation-save">保存</button><button id="preview-selected" class="secondary" data-agent-id="selected-pdf-preview">PDFプレビュー</button></div>
@@ -140,6 +140,12 @@
   <dialog id="pdf-dialog" class="pdf-dialog">
     <div class="dialog-head"><div><p class="eyebrow">SOURCE DOCUMENT</p><h2 id="pdf-title">PDF</h2></div><div class="button-row"><a id="pdf-new-tab" class="secondary button-link" target="_blank" rel="noopener">別タブ</a><button id="pdf-close" class="icon-button" data-agent-id="pdf-close" aria-label="閉じる">×</button></div></div>
     <iframe id="pdf-frame" title="特許PDFプレビュー"></iframe>
+  </dialog>
+
+  <dialog id="claim-dialog" class="compact-dialog claim-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">VERIFIED SOURCE</p><h2 id="claim-dialog-title">請求項</h2></div><button class="icon-button" data-close-dialog="claim-dialog" aria-label="閉じる">×</button></div>
+    <p id="claim-dialog-meta" class="muted"></p>
+    <pre id="claim-dialog-text" class="claim-source-text"></pre>
   </dialog>
 
   <dialog id="preflight-dialog" class="compact-dialog">

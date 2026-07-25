@@ -1,5 +1,9 @@
 # PatentViewer
 
+SQLite保存方式、既存JSONからの移行、新しい本番端末を空DBで構築する手順は
+[docs/SQLITE_STORAGE.md](docs/SQLITE_STORAGE.md) と
+[docs/PRODUCTION_BOOTSTRAP.md](docs/PRODUCTION_BOOTSTRAP.md) を参照してください。
+
 ローカルの `patent_pool/` を共有PDF格納庫として、リサーチ単位の特許マップ、PDFプレビュー、解釈メモ、人間とCodexの可視UI協働を提供するHTMLベースのPatentViewerです。
 
 ## 現在できること
@@ -47,6 +51,8 @@ python tools/patent_viewer.py doctor
 ```
 
 別デバイスではclone後に同じ3コマンドを実行します。デバイス固有のPythonパスとMCP設定は `.codex/mcp.local.json`、実行ごとの接続トークンは `runtime/server-control.json` に生成され、Gitには保存されません。UIだけを軽く使用する場合は `start --no-managed-ollama` を指定できます。詳細は [Codex collaboration設計](docs/CODEX_COLLABORATION.md) を参照してください。
+
+本番端末を新しいPDF・空のデータストアから構築する場合は、[本番端末の新規構築手順](docs/PRODUCTION_BOOTSTRAP.md) を使用します。開発端末のPDF、DB、分析結果は本番へ移行しません。移行先のCodexはこの文書を最初に読み、現在の実装との差分を確認してから環境構築します。
 
 ローカルLLM検証を含むPython依存パッケージは次で導入できます。
 
@@ -104,13 +110,17 @@ PDF選択、小型プロンプト5件、小型JSON Schema 5件、出力分離、
 
 通常の複数文献分析は、PDF抽出と章・請求項分割をPythonで行った後、ローカルLLMへ「類似度」「権利範囲の広さ」「課題要約」「技術要約」の4つの小さなJSONだけを個別に要求します。各要求には専用の小さなJSON Schemaを適用し、Ollamaの生成制約に加えてPythonでも型、必須キー、追加キー、値域、文字数を再検証します。その後、自社技術定義を技術・対象課題の2要約へ一度だけ正規化し、文献と自社のEmbedding、リサーチ内クラスタ、短いクラスタ名、コサイン距離による意味順と自社近接度を確定します。
 
+前処理ではページ・段落ID、章と役割、重複・定型句、請求項の構成要件と限定をルールベースで構造化します。LLMへ渡す文字数上限は変えず、4タスクごとに関連性の高い原文だけを選んだEvidence Packを生成します。元の抽出全文と採用根拠は保持され、後段のLLM・Embedding・クラスタリング契約は従来どおりです。
+
+文献別の生成LLMは通常、従来どおり4回です。類似度と権利範囲の広さは根拠となる構成要件ID、課題要約は根拠段落ID、技術要約は構成要件または段落IDを小さな配列で返します。Pythonは各IDがそのタスクのEvidence Packへ実際に含まれていたかを検証します。不一致なら、そのタスクだけ候補IDを限定して1回自動再生成するため、その文献は5回以上になることがあります。再生成も不一致なら文献を失敗扱いにし、検証過程とrun単位の検証率を記録します。
+
 ```powershell
 python tools/run_research_pipeline.py laser_process_landscape --stage plan
 python tools/run_research_pipeline.py laser_process_landscape --stage prepare
 python tools/run_research_pipeline.py laser_process_landscape --stage execute
 ```
 
-共有抽出キャッシュは `runtime/shared/extractions/` に置きますが、元PDFを常に正とし、リサーチ／文献ごとに再抽出や全文読解を選べます。脅威マップは従来どおり「自社技術との類似度 × 権利範囲の広さ」の5×5です。詳細は [docs/RESEARCH_PIPELINE_DESIGN.md](docs/RESEARCH_PIPELINE_DESIGN.md) を参照してください。
+共有抽出キャッシュは `runtime/shared/extractions/` に置きます。抽出全文・ページ別本文に加え、PDFだけで決まる章・段落・請求項・構成要件の構造化結果もPDFハッシュ単位で共有します。自社技術や読取方針に依存するEvidence Packと分析結果はリサーチ別に保存します。元PDFを常に正とし、リサーチ／文献ごとに再抽出や全文読解を選べます。脅威マップは従来どおり「自社技術との類似度 × 権利範囲の広さ」の5×5です。詳細は [docs/RESEARCH_PIPELINE_DESIGN.md](docs/RESEARCH_PIPELINE_DESIGN.md) を参照してください。
 
 同じ操作は画面上部の `夜間一括分析` から、Codexを介さず実行できます。`全件を再分析`を選べば既存結果を手動削除せずに全PDFを更新できます。アプリは既存の11434番Ollamaに干渉せず、空きローカルポートで専用Ollamaを起動・監視・終了します。GPUの総VRAMと空きVRAMから生成並列数とEmbeddingバッチ数を自動決定し、短文タスク、長文タスク、Embeddingの順にまとめてモデル再ロードを抑えます。UIでは冷却時間を0〜180秒（既定0）で指定でき、現在工程、工程経過、総経過、推定残り、工程別実績を確認できます。冷却待機中もモデルはVRAMに保持します。文献別の `analysis_progress.json` に完了タスクを保存するため、停止後は文献全体ではなく未完了タスクから再開します。1文献のJSON生成・Schema検証・Embedding検証に失敗した場合は、その文献だけを失敗として記録して次文献へ進みます。要求と応答は文献別の `attempts/<run-id>/llm_calls/`、最新失敗は `analysis_error.json`、run全体の設定・失敗・スキップ一覧は `run_manifest.json` に保存します。pause/resume/cancelが使用でき、実行中はブラウザが閉じてもサーバーのアイドル終了を抑止します。
 

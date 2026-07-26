@@ -677,6 +677,265 @@ class SQLiteStore:
             "overlay_aggregates": overlay_aggregates,
         }
 
+    def cell_trend(
+        self,
+        research_id: str,
+        *,
+        cell_type: str,
+        selected_year_from: int | None = None,
+        selected_year_to: int | None = None,
+        **filters: Any,
+    ) -> dict[str, Any]:
+        if cell_type not in {"threat", "technology"}:
+            raise ValueError("cell_type must be threat or technology")
+        cell_filters = dict(filters)
+        cell_filters.pop("year_from", None)
+        cell_filters.pop("year_to", None)
+        cell_filters["analysis_states"] = ["ready"]
+        if cell_type == "threat":
+            if cell_filters.get("similarity") is None or cell_filters.get("concept_level") is None:
+                raise ValueError("threat trend requires similarity and concept_level")
+            cell_filters.pop("tech_cluster_id", None)
+            cell_filters.pop("problem_cluster_id", None)
+        else:
+            if cell_filters.get("tech_cluster_id") is None or cell_filters.get("problem_cluster_id") is None:
+                raise ValueError("technology trend requires tech_cluster_id and problem_cluster_id")
+            cell_filters.pop("similarity", None)
+            cell_filters.pop("concept_level", None)
+
+        baseline_filters = dict(cell_filters)
+        for key in ("similarity", "concept_level", "tech_cluster_id", "problem_cluster_id"):
+            baseline_filters.pop(key, None)
+        cell_where, cell_params, cell_joins = self._filters(research_id, **cell_filters)
+        baseline_where, baseline_params, baseline_joins = self._filters(
+            research_id, **baseline_filters
+        )
+        selected_filters = dict(cell_filters)
+        selected_filters["year_from"] = selected_year_from
+        selected_filters["year_to"] = selected_year_to
+        selected_where, selected_params, selected_joins = self._filters(
+            research_id, **selected_filters
+        )
+        with self.connect() as connection:
+            bounds = connection.execute(
+                """
+                SELECT MIN(year) AS first_year, MAX(year) AS last_year
+                FROM documents
+                WHERE research_id=? AND year IS NOT NULL
+                """,
+                (research_id,),
+            ).fetchone()
+            cell_rows = connection.execute(
+                f"""
+                SELECT d.year, COUNT(DISTINCT d.patent_id) AS count
+                FROM documents d{cell_joins}
+                WHERE {cell_where} AND d.year IS NOT NULL
+                GROUP BY d.year ORDER BY d.year
+                """,
+                cell_params,
+            ).fetchall()
+            status_rows = connection.execute(
+                f"""
+                SELECT d.year,
+                       CASE
+                           WHEN d.legal_status_category IN (
+                               'rights_acquired', 'under_examination', 'published'
+                           ) THEN d.legal_status_category
+                           ELSE 'published'
+                       END AS status,
+                       COUNT(DISTINCT d.patent_id) AS count
+                FROM documents d{cell_joins}
+                WHERE {cell_where} AND d.year IS NOT NULL
+                GROUP BY d.year, status
+                ORDER BY d.year, status
+                """,
+                cell_params,
+            ).fetchall()
+            baseline_rows = connection.execute(
+                f"""
+                SELECT d.year, COUNT(DISTINCT d.patent_id) AS count
+                FROM documents d{baseline_joins}
+                WHERE {baseline_where} AND d.year IS NOT NULL
+                GROUP BY d.year ORDER BY d.year
+                """,
+                baseline_params,
+            ).fetchall()
+            cell_total = int(
+                connection.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT d.patent_id) AS count
+                    FROM documents d{cell_joins}
+                    WHERE {cell_where}
+                    """,
+                    cell_params,
+                ).fetchone()["count"]
+            )
+            year_source_rows = connection.execute(
+                f"""
+                SELECT COALESCE(NULLIF(d.year_source, ''), 'unknown') AS year_source,
+                       COUNT(DISTINCT d.patent_id) AS count
+                FROM documents d{cell_joins}
+                WHERE {cell_where} AND d.year IS NOT NULL
+                GROUP BY COALESCE(NULLIF(d.year_source, ''), 'unknown')
+                """,
+                cell_params,
+            ).fetchall()
+            selected_count = int(
+                connection.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT d.patent_id) AS count
+                    FROM documents d{selected_joins}
+                    WHERE {selected_where}
+                    """,
+                    selected_params,
+                ).fetchone()["count"]
+            )
+            organization_rows = connection.execute(
+                f"""
+                WITH filtered AS (
+                    SELECT DISTINCT
+                           d.research_id,
+                           d.patent_id,
+                           CASE
+                               WHEN d.legal_status_category IN (
+                                   'rights_acquired', 'under_examination', 'published'
+                               ) THEN d.legal_status_category
+                               ELSE 'published'
+                           END AS status
+                    FROM documents d{selected_joins}
+                    WHERE {selected_where}
+                )
+                SELECT cell_dor.organization_id,
+                       MAX(o.name) AS name,
+                       filtered.status,
+                       COUNT(DISTINCT filtered.patent_id) AS count
+                FROM filtered
+                JOIN document_organizations cell_dor
+                  ON cell_dor.research_id=filtered.research_id
+                 AND cell_dor.patent_id=filtered.patent_id
+                JOIN organizations o
+                  ON o.research_id=cell_dor.research_id
+                 AND o.organization_id=cell_dor.organization_id
+                GROUP BY cell_dor.organization_id, filtered.status
+                ORDER BY cell_dor.organization_id, filtered.status
+                """,
+                selected_params,
+            ).fetchall()
+
+        first_year = int(bounds["first_year"]) if bounds["first_year"] is not None else None
+        last_year = int(bounds["last_year"]) if bounds["last_year"] is not None else None
+        cell_counts = {int(row["year"]): int(row["count"]) for row in cell_rows}
+        baseline_counts = {int(row["year"]): int(row["count"]) for row in baseline_rows}
+        yearly_statuses: dict[int, dict[str, int]] = {}
+        for row in status_rows:
+            yearly_statuses.setdefault(int(row["year"]), {})[str(row["status"])] = int(
+                row["count"]
+            )
+        organization_values: dict[str, dict[str, Any]] = {}
+        for row in organization_rows:
+            organization_id = str(row["organization_id"])
+            item = organization_values.setdefault(
+                organization_id,
+                {
+                    "organization_id": organization_id,
+                    "name": str(row["name"]),
+                    "status_counts": {
+                        "rights_acquired": 0,
+                        "under_examination": 0,
+                        "published": 0,
+                    },
+                },
+            )
+            item["status_counts"][str(row["status"])] = int(row["count"])
+        organizations = []
+        for item in organization_values.values():
+            item["count"] = sum(item["status_counts"].values())
+            item["share"] = (
+                round(item["count"] / selected_count, 6) if selected_count else 0.0
+            )
+            organizations.append(item)
+        organizations.sort(key=lambda item: (-item["count"], item["name"]))
+        years = range(first_year, last_year + 1) if first_year is not None and last_year is not None else ()
+        series = [
+            {
+                "year": year,
+                "count": cell_counts.get(year, 0),
+                "status_counts": {
+                    status: yearly_statuses.get(year, {}).get(status, 0)
+                    for status in ("rights_acquired", "under_examination", "published")
+                },
+                "total": baseline_counts.get(year, 0),
+                "share": round(cell_counts.get(year, 0) / baseline_counts[year], 6)
+                if baseline_counts.get(year, 0)
+                else 0.0,
+            }
+            for year in years
+        ]
+        counts = [item["count"] for item in series]
+        dated_total = sum(counts)
+        undated = max(0, cell_total - dated_total)
+        peak_count = max(counts, default=0)
+        peak_year = next(
+            (item["year"] for item in series if item["count"] == peak_count and peak_count),
+            None,
+        )
+        recent = sum(counts[-3:])
+        previous = sum(counts[-6:-3])
+        nonzero_years = [item["year"] for item in series if item["count"]]
+        if cell_total == 0:
+            direction = "unobserved"
+        elif dated_total == 0:
+            direction = "undated"
+        elif dated_total < 3:
+            direction = "sparse"
+        elif nonzero_years and nonzero_years[0] >= (last_year or nonzero_years[0]) - 2 and previous == 0:
+            direction = "emerging"
+        elif recent >= previous * 1.25 and recent - previous >= 2:
+            direction = "growing"
+        elif previous >= 3 and recent <= previous * 0.75:
+            direction = "declining"
+        else:
+            direction = "stable"
+        current_year = datetime.now(timezone.utc).year
+        year_sources = {
+            str(row["year_source"]): int(row["count"]) for row in year_source_rows
+        }
+        year_basis = (
+            "application_year"
+            if year_sources and set(year_sources) == {"application_date"}
+            else "mixed_available_year"
+        )
+        provisional = any(
+            item["year"] >= current_year - 1 and item["count"] > 0 for item in series
+        )
+        return {
+            "research_id": research_id,
+            "cell_type": cell_type,
+            "series": series,
+            "summary": {
+                "total": cell_total,
+                "selected_count": selected_count,
+                "dated_total": dated_total,
+                "undated": undated,
+                "peak_year": peak_year,
+                "peak_count": peak_count,
+                "recent_three_years": recent,
+                "previous_three_years": previous,
+                "direction": direction,
+                "provisional": provisional,
+            },
+            "selected_range": {
+                "from": selected_year_from,
+                "to": selected_year_to,
+            },
+            "year_basis": year_basis,
+            "year_sources": year_sources,
+            "organizations": organizations[:10],
+            "organization_count": len(organizations),
+            "status_basis": "current_status",
+            "immature_from": current_year - 1,
+        }
+
     def _aggregates(
         self,
         connection: sqlite3.Connection,

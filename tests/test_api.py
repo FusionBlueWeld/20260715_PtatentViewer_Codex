@@ -44,6 +44,39 @@ class ApiTests(unittest.TestCase):
         req=Request(f"http://127.0.0.1:{self.port}/api/pdfs/JPA%202026000001-000000.pdf")
         with urlopen(req) as response: self.assertEqual(response.headers.get_content_type(), "application/pdf")
 
+    def test_cell_trend_api_supports_both_maps_and_highlight_range(self):
+        threat = self.request(
+            "/api/researches/normal_research/cell-trend"
+            "?cell_type=threat&similarity=4&concept_level=5"
+            "&selected_year_from=2024&selected_year_to=2024"
+        )
+        self.assertEqual(threat["cell_type"], "threat")
+        self.assertEqual(threat["selected_range"], {"from": 2024, "to": 2024})
+        self.assertEqual(threat["series"][-1]["year"], 2026)
+        self.assertEqual(threat["series"][-1]["count"], 1)
+        self.assertEqual(threat["series"][-1]["status_counts"]["published"], 1)
+        self.assertEqual(threat["summary"]["total"], 1)
+        self.assertEqual(threat["summary"]["selected_count"], 0)
+        self.assertEqual(threat["summary"]["dated_total"], 1)
+        self.assertEqual(threat["summary"]["undated"], 0)
+        self.assertEqual(threat["year_basis"], "mixed_available_year")
+        self.assertEqual(threat["year_sources"], {"legacy": 1})
+        self.assertEqual(threat["organizations"], [])
+
+        technology = self.request(
+            "/api/researches/normal_research/cell-trend"
+            "?cell_type=technology&tech_cluster_id=0&problem_cluster_id=0"
+        )
+        self.assertEqual(technology["cell_type"], "technology")
+        self.assertEqual(technology["series"][-1]["count"], 1)
+        self.assertEqual(technology["organizations"][0]["name"], "Company A")
+        self.assertEqual(technology["organizations"][0]["count"], 1)
+        self.assertEqual(technology["organizations"][0]["share"], 1.0)
+        self.request(
+            "/api/researches/normal_research/cell-trend?cell_type=threat",
+            expected=400,
+        )
+
     def test_organization_group_api(self):
         manifest_path = self.root / "researches/normal_research/patents.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

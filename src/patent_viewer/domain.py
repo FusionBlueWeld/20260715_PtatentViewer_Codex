@@ -1026,6 +1026,10 @@ class Repository:
         self.sync_research(environment, research_id)
         return self.store(environment).document_page(research_id, **filters)
 
+    def cell_trend(self, environment: str, research_id: str, **filters: Any) -> dict[str, Any]:
+        self.sync_research(environment, research_id)
+        return self.store(environment).cell_trend(research_id, **filters)
+
     def pdf_path(self, pdf_name: str) -> Path:
         if Path(pdf_name).name != pdf_name or not pdf_name.lower().endswith(".pdf"):
             raise DataError("不正なPDF名です")

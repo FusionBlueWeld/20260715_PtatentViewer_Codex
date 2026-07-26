@@ -288,6 +288,37 @@ class PatentViewerHandler(BaseHTTPRequestHandler):
             env = query.get("environment", [self.state.environment])[0]
             include_patents = query.get("include_patents", ["true"])[0].lower() not in {"0", "false", "no"}
             return self._json(200, self.state.repo.dashboard(env, research_id, include_patents=include_patents))
+        if path.startswith("/api/researches/") and path.endswith("/cell-trend"):
+            research_id = path.split("/")[3]
+            env = query.get("environment", [self.state.environment])[0]
+
+            def trend_integer(name: str) -> int | None:
+                raw = query.get(name, [None])[0]
+                if raw in {None, ""}:
+                    return None
+                try:
+                    return int(raw)
+                except (TypeError, ValueError) as exc:
+                    raise DataError(f"{name}は整数で指定してください") from exc
+
+            try:
+                result = self.state.repo.cell_trend(
+                    env,
+                    research_id,
+                    cell_type=query.get("cell_type", [""])[0],
+                    selected_year_from=trend_integer("selected_year_from"),
+                    selected_year_to=trend_integer("selected_year_to"),
+                    query=query.get("q", [""])[0],
+                    statuses=[item for value in query.get("status", []) for item in value.split(",") if item],
+                    similarity=trend_integer("similarity"),
+                    concept_level=trend_integer("concept_level"),
+                    tech_cluster_id=query.get("tech_cluster_id", [None])[0],
+                    problem_cluster_id=query.get("problem_cluster_id", [None])[0],
+                    organization_ids=[item for value in query.get("organization_id", []) for item in value.split(",") if item],
+                )
+            except ValueError as exc:
+                raise DataError(str(exc)) from exc
+            return self._json(200, result)
         if path.startswith("/api/researches/") and path.endswith("/documents"):
             research_id = path.split("/")[3]
             env = query.get("environment", [self.state.environment])[0]

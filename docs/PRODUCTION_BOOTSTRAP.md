@@ -1,10 +1,19 @@
 # 本番端末の新規構築手順
 
+> **現行の正本:** 新しい端末・Codex環境の具体的な構築、現行Gitに含まれる
+> 112文献のリサーチ入力、環境台帳、受入条件、障害対応は
+> [`ENVIRONMENT_MIGRATION_RUNBOOK.md`](ENVIRONMENT_MIGRATION_RUNBOOK.md)
+> を使用する。この文書はデータ境界の基本方針を補足する。
+
 ## 目的と前提
 
 この文書は、別端末のCodexがPatentViewerの本番環境を新規構築するときの作業指示である。
 
-本番端末は、開発端末からデータを移行せず、空の状態から運用を開始する。
+この文書は、NORMALリサーチ入力を含まない専用releaseを使い、完全な空状態から始める場合の補足資料である。現行release候補には112文献のリサーチ入力がGit追跡対象として含まれるため、そのまま移行する場合は
+[`ENVIRONMENT_MIGRATION_RUNBOOK.md`](ENVIRONMENT_MIGRATION_RUNBOOK.md)
+を正とする。
+
+空環境用releaseを使う本番端末は、開発端末からデータを移行せず、空の状態から運用を開始する。
 
 - 開発端末のPDFを移行しない。
 - 開発端末のSQLite DB、JSON分析結果、抽出キャッシュ、実行履歴を移行しない。
@@ -16,7 +25,7 @@
 
 移行先では、Codexに次のように依頼する。
 
-> このリポジトリの `docs/PRODUCTION_BOOTSTRAP.md` を最後まで読み、記載されたデータ境界を守って本番環境を新規構築してください。旧端末のPDF、DB、分析結果は移行せず、空のデータストアから開始してください。実行前に現在の実装と文書の差分を確認し、未実装のコマンドを存在するものとして扱わないでください。
+> このリポジトリの `docs/ENVIRONMENT_MIGRATION_RUNBOOK.md` を最後まで読み、Phase 0から順番に本番環境を構築してください。空環境用releaseを使う場合だけ `docs/PRODUCTION_BOOTSTRAP.md` の追加条件も適用してください。実行前に現在の実装と文書の差分を確認し、未実装のコマンドを存在するものとして扱わないでください。
 
 Codexは、作業開始時にこの文書だけでなく、`README.md`、`docs/CODEX_COLLABORATION.md`、`.gitignore`、`requirements.txt`、実際の起動・DB初期化コードも確認すること。
 
@@ -105,7 +114,7 @@ python -m pip install -r requirements.txt
 python tools/migrate_to_sqlite.py --environment normal --verify-only
 ```
 
-期待する結果は次のとおり。
+空環境用releaseで期待する結果は次のとおり。現行の112文献リサーチ入力を含むreleaseには、この0件条件を適用しない。
 
 - 本番用SQLite DBが新規作成される。
 - スキーマが最新バージョンになる。

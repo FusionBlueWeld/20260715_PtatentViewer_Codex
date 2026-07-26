@@ -112,6 +112,26 @@
         </article>
       </section>
 
+      <section id="cell-trend-panel" class="panel trend-panel hidden" aria-live="polite">
+        <header class="panel-head">
+          <div><p class="eyebrow">CELL INSIGHT</p><h2 id="cell-trend-title">選択セルの分析</h2></div>
+          <div class="trend-panel-controls"><div class="trend-view-tabs" role="group" aria-label="セルグラフ切替"><button class="active" data-trend-mode="year" aria-pressed="true">年次推移</button><button data-trend-mode="organization" aria-pressed="false">出願人構成</button></div><span id="cell-trend-status" class="status-pill">出願年基準</span></div>
+        </header>
+        <div id="cell-trend-loading" class="trend-loading">セル情報を集計しています…</div>
+        <div id="cell-trend-content" class="hidden">
+          <div class="trend-summary">
+            <span><small id="cell-trend-total-label">累計件数</small><b id="cell-trend-total">0</b></span>
+            <span><small id="cell-trend-peak-label">ピーク年</small><b id="cell-trend-peak">—</b></span>
+            <span><small id="cell-trend-recent-label">直近3年</small><b id="cell-trend-recent">0</b></span>
+            <span><small id="cell-trend-direction-label">傾向</small><b id="cell-trend-direction">—</b></span>
+          </div>
+          <div id="cell-trend-chart" class="trend-chart" role="img" aria-label="選択セルのグラフ"></div>
+          <div id="cell-trend-legend" class="trend-legend"></div>
+          <p id="cell-trend-note" class="map-note"></p>
+        </div>
+        <div id="cell-trend-error" class="trend-error hidden"></div>
+      </section>
+
       <section class="lower-grid">
         <article class="panel patent-list-panel">
           <header class="panel-head"><div><p class="eyebrow">LINKED DOCUMENTS</p><h2>対象文献</h2></div><button id="clear-cell" class="text-button hidden" data-agent-id="cell-filter-clear">セル選択を解除</button></header>
@@ -293,6 +313,7 @@
   </aside>
 
   <div id="toast" class="toast" role="status"></div>
+  <script src="/assets/whitespace-analysis.js"></script>
   <script type="module" src="/assets/app.js"></script>
   <script type="module" src="/assets/agent-bridge.js"></script>
 </body>

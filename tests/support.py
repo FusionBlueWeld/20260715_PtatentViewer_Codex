@@ -13,11 +13,12 @@ def build_fixture(root: Path):
         (base / "results").mkdir(parents=True)
         (base / "research.json").write_text(json.dumps({"name": research_id, "description": "fixture", "company_technology": "test"}), encoding="utf-8")
         pdf = "JPA 2026000001-000000.pdf" if research_id.startswith("normal") else "JPB 000000001-000000.pdf"
-        manifest = {"name": "sample", "patents": [{"pdf": pdf, "year": 2026}]}
+        manifest = {"name": "sample", "patents": [{"pdf": pdf, "year": 2026, "applicant": "Company A"}]}
         (base / "patents.json").write_text(json.dumps(manifest), encoding="utf-8")
         key = Path(pdf).stem.replace(" ", "_")
         result = {
             "similarity": 4, "concept_level": 5, "tech_cluster": "A", "problem_cluster": "B",
+            "tech_cluster_id": 0, "problem_cluster_id": 0,
             "tech_summary": "fixture tech", "problem_summary": "fixture problem", "reasoning": "fixture reason"
         }
         (base / f"results/{key}.json").write_text(json.dumps(result), encoding="utf-8")

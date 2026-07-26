@@ -1,8 +1,10 @@
 # PatentViewer
 
-SQLite保存方式、既存JSONからの移行、新しい本番端末を空DBで構築する手順は
-[docs/SQLITE_STORAGE.md](docs/SQLITE_STORAGE.md) と
-[docs/PRODUCTION_BOOTSTRAP.md](docs/PRODUCTION_BOOTSTRAP.md) を参照してください。
+別端末・新しいCodex環境への本番移行は、最初に
+[docs/ENVIRONMENT_MIGRATION_RUNBOOK.md](docs/ENVIRONMENT_MIGRATION_RUNBOOK.md)
+を参照してください。SQLite保存方式は
+[docs/SQLITE_STORAGE.md](docs/SQLITE_STORAGE.md)、従来の新規構築方針は
+[docs/PRODUCTION_BOOTSTRAP.md](docs/PRODUCTION_BOOTSTRAP.md) にあります。
 
 ローカルの `patent_pool/` を共有PDF格納庫として、リサーチ単位の特許マップ、PDFプレビュー、解釈メモ、人間とCodexの可視UI協働を提供するHTMLベースのPatentViewerです。
 
@@ -52,7 +54,7 @@ python tools/patent_viewer.py doctor
 
 別デバイスではclone後に同じ3コマンドを実行します。デバイス固有のPythonパスとMCP設定は `.codex/mcp.local.json`、実行ごとの接続トークンは `runtime/server-control.json` に生成され、Gitには保存されません。UIだけを軽く使用する場合は `start --no-managed-ollama` を指定できます。詳細は [Codex collaboration設計](docs/CODEX_COLLABORATION.md) を参照してください。
 
-本番端末を新しいPDF・空のデータストアから構築する場合は、[本番端末の新規構築手順](docs/PRODUCTION_BOOTSTRAP.md) を使用します。開発端末のPDF、DB、分析結果は本番へ移行しません。移行先のCodexはこの文書を最初に読み、現在の実装との差分を確認してから環境構築します。
+本番端末を構築する場合は、[環境移行・本番初回構築ランブック](docs/ENVIRONMENT_MIGRATION_RUNBOOK.md) を使用します。NORMALリサーチ入力を含まない専用releaseから完全な空環境を作る場合だけ、[本番端末の新規構築手順](docs/PRODUCTION_BOOTSTRAP.md) の追加条件も使用します。開発端末のDB、runtime、分析結果は本番へ移行しません。
 
 ローカルLLM検証を含むPython依存パッケージは次で導入できます。
 

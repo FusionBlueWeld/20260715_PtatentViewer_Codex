@@ -7,7 +7,8 @@ const state = {
   cellFilter: null, view: 'threat', pipelineJob: null, pipelineReady: false, pipelineRunnable: false, pipelinePending: 0, pipelineAvailable: 0, techClusterMinSize: 1,
   organizationMode: 'organization', selectedOrganization: null, editingOrganizationGroup: null,
   pipelineResearchId: null, managedResearches: [], legalStatusDraft: { rights_acquired: [], under_examination: [] },
-  documentPage: { total: 0, offset: 0, limit: 200, hasMore: false, loading: false, request: 0 }, filterTimer: null
+  documentPage: { total: 0, offset: 0, limit: 200, hasMore: false, loading: false, request: 0 }, filterTimer: null,
+  trendRequest: 0, trendCache: new Map(), cellTrendData: null, cellChartMode: 'year'
 };
 
 const statusLabel = { rights_acquired: '権利化', under_examination: '審査中', published: '公開', registered: '権利化', unknown: '公開' };
@@ -62,7 +63,8 @@ async function loadResearches(preferred) {
 
 async function loadDashboard(researchId) {
   state.dashboard = await api(`/api/researches/${encodeURIComponent(researchId)}/dashboard?environment=${state.environment}&include_patents=false`);
-  state.selected = null; state.cellFilter = null; state.selectedOrganization = null; state.editingOrganizationGroup = null;
+  state.selected = null; state.cellFilter = null; state.selectedOrganization = null; state.editingOrganizationGroup = null;state.trendCache.clear();state.trendRequest++;state.cellTrendData=null;
+  $('#cell-trend-panel').classList.add('hidden');
   $('#research-title').textContent = state.dashboard.research.name;
   $('#research-description').textContent = state.dashboard.research.description;
   $('#pool-count').textContent = state.dashboard.pool_count;
@@ -89,7 +91,7 @@ function filters() {
 function applyFilters() {
   if (!state.dashboard) return Promise.resolve();
   clearTimeout(state.filterTimer);
-  return new Promise(resolve=>{state.filterTimer=setTimeout(()=>refreshDocuments(true).finally(resolve),120);});
+  return new Promise(resolve=>{state.filterTimer=setTimeout(()=>Promise.all([refreshDocuments(true),state.cellFilter?refreshCellTrend():Promise.resolve()]).finally(resolve),120);});
 }
 
 function documentQuery(offset=0){
@@ -102,6 +104,116 @@ function documentQuery(offset=0){
   if(state.cellFilter?.type==='technology'){parameters.set('tech_cluster_id',String(state.cellFilter.tech));parameters.set('problem_cluster_id',String(state.cellFilter.problem));}
   if(state.selectedOrganization?.memberIds?.length)parameters.set('organization_id',state.selectedOrganization.memberIds.join(','));
   return parameters;
+}
+
+function trendQuery(){
+  const f=filters(),parameters=new URLSearchParams({environment:state.environment,cell_type:state.cellFilter.type});
+  if(f.query)parameters.set('q',f.query);
+  parameters.set('status',f.statuses.size?[...f.statuses].join(','):'__none__');
+  if(f.yearFrom)parameters.set('selected_year_from',String(f.yearFrom));
+  if(f.yearTo)parameters.set('selected_year_to',String(f.yearTo));
+  if(state.cellFilter.type==='threat'){parameters.set('similarity',String(state.cellFilter.x));parameters.set('concept_level',String(state.cellFilter.y));}
+  if(state.cellFilter.type==='technology'){parameters.set('tech_cluster_id',String(state.cellFilter.tech));parameters.set('problem_cluster_id',String(state.cellFilter.problem));}
+  if(state.selectedOrganization?.memberIds?.length)parameters.set('organization_id',state.selectedOrganization.memberIds.join(','));
+  return parameters;
+}
+
+async function refreshCellTrend(){
+  if(!state.dashboard||!state.cellFilter)return;
+  const request=++state.trendRequest,researchId=encodeURIComponent(state.dashboard.research.id),query=trendQuery();
+  const key=`${researchId}?${query}`;const panel=$('#cell-trend-panel');
+  panel.classList.remove('hidden');$('#cell-trend-loading').classList.remove('hidden');$('#cell-trend-content').classList.add('hidden');$('#cell-trend-error').classList.add('hidden');
+  try{
+    const data=state.trendCache.get(key)||await api(`/api/researches/${researchId}/cell-trend?${query}`);
+    state.trendCache.set(key,data);if(request!==state.trendRequest)return;
+    if(Number(data.summary?.selected_count||0)===0){panel.classList.add('hidden');state.cellTrendData=data;return;}
+    renderCellTrend(data);
+  }catch(error){
+    if(request!==state.trendRequest)return;
+    $('#cell-trend-loading').classList.add('hidden');$('#cell-trend-error').classList.remove('hidden');$('#cell-trend-error').textContent=`年次推移を取得できません: ${error.message}`;
+  }
+}
+
+const trendStatusKeys=['rights_acquired','under_examination','published'];
+const trendStatusLabels={rights_acquired:'権利化',under_examination:'審査中',published:'公開'};
+function trendStatusLegend(extra=''){
+  return `${trendStatusKeys.map(key=>`<span><i class="${key}"></i>${trendStatusLabels[key]}</span>`).join('')}${extra}`;
+}
+function trendStatusSegments(counts,fallbackTotal=0){
+  const values=trendStatusKeys.map(key=>[key,Number(counts?.[key]||0)]),statusTotal=values.reduce((sum,[,value])=>sum+value,0);
+  if(statusTotal===0&&fallbackTotal>0)return `<i class="status-segment unclassified" style="flex:${fallbackTotal}" title="法的状態の内訳未取得 ${fallbackTotal}件"></i>`;
+  return values.map(([key,value])=>value?`<i class="status-segment ${key}" style="flex:${value}" title="${trendStatusLabels[key]} ${value}件"></i>`:'').join('');
+}
+
+function renderCellTrend(data){
+  const selection=state.cellFilter;if(!selection)return;state.cellTrendData=data;
+  const summary=data.summary||{},title=selection.label+(state.selectedOrganization&&data.cell_type==='threat'?` / ${state.selectedOrganization.name}`:'');
+  $('#cell-trend-title').textContent=title;
+  $('#cell-trend-loading').classList.add('hidden');$('#cell-trend-error').classList.add('hidden');$('#cell-trend-content').classList.remove('hidden');$('#cell-trend-panel').classList.remove('hidden');
+  renderCellTrendMode();
+}
+
+function renderCellTrendMode(){
+  const data=state.cellTrendData,selection=state.cellFilter;if(!data||!selection)return;
+  $$('[data-trend-mode]').forEach(button=>{const active=button.dataset.trendMode===state.cellChartMode;button.classList.toggle('active',active);button.setAttribute('aria-pressed',String(active));});
+  if(state.cellChartMode==='organization')renderOrganizationTrend(data);else renderYearTrend(data);
+}
+
+function renderYearTrend(data){
+  const chart=$('#cell-trend-chart'),series=data.series||[],summary=data.summary||{},maximum=Math.max(1,...series.map(item=>Number(item.count||0)));
+  const range=data.selected_range||{},hasRange=range.from!=null||range.to!=null;
+  const inRange=year=>(range.from==null||year>=range.from)&&(range.to==null||year<=range.to);
+  const directionLabels=data.cell_type==='threat'
+    ? {unobserved:'未観測',undated:'年不明',sparse:'散発',emerging:'脅威流入',growing:'脅威増加',stable:'安定',declining:'脅威減少'}
+    : {unobserved:'未観測',undated:'年不明',sparse:'散発',emerging:'新興',growing:'成長',stable:'安定',declining:'減速'};
+  const applicationYearOnly=data.year_basis==='application_year';
+  $('#cell-trend-status').textContent=applicationYearOnly?'出願年基準':'年情報基準（補完年を含む）';
+  $('#cell-trend-total-label').textContent='累計件数';$('#cell-trend-peak-label').textContent='ピーク年';$('#cell-trend-recent-label').textContent='直近3年';$('#cell-trend-direction-label').textContent='傾向';
+  $('#cell-trend-total').textContent=`${Number(summary.total||0)}件`;
+  $('#cell-trend-peak').textContent=summary.peak_year?`${summary.peak_year}年 / ${summary.peak_count}件`:'—';
+  $('#cell-trend-recent').textContent=`${Number(summary.recent_three_years||0)}件`;
+  $('#cell-trend-direction').textContent=`${directionLabels[summary.direction]||summary.direction||'—'}${summary.provisional?'（暫定）':''}`;
+  chart.className='trend-chart';chart.innerHTML='';
+  series.forEach(item=>{
+    const count=Number(item.count||0),year=Number(item.year),bar=document.createElement('div');
+    bar.className=`trend-year${count?'':' zero'}${hasRange&&inRange(year)?' in-range':''}${year>=Number(data.immature_from)?' immature':''}`;
+    bar.setAttribute('aria-label',`${year}年、${count}件、全体${Number(item.total||0)}件、構成比${(Number(item.share||0)*100).toFixed(1)}%`);
+    bar.title=`${year}年\n選択セル: ${count}件\n全体: ${Number(item.total||0)}件\n構成比: ${(Number(item.share||0)*100).toFixed(1)}%`;
+    const height=count?Math.max(4,count/maximum*100):0;
+    bar.innerHTML=`<span class="value">${count}</span><span class="bar-track"><span class="stacked-bar" style="height:${height}%">${trendStatusSegments(item.status_counts,count)}</span></span><small class="year">${year}</small>`;
+    chart.append(bar);
+  });
+  chart.setAttribute('aria-label',`${$('#cell-trend-title').textContent}の年別件数。累計${Number(summary.total||0)}件、傾向${directionLabels[summary.direction]||summary.direction||'未判定'}`);
+  const hasStatusBreakdown=series.some(item=>trendStatusKeys.some(key=>Number(item.status_counts?.[key]||0)>0));
+  $('#cell-trend-legend').innerHTML=trendStatusLegend(`${hasStatusBreakdown?'':'<span><i class="unclassified"></i>状態内訳未取得</span>'}<span><i class="selected"></i>選択中の年範囲</span><span><i class="immature"></i>公開遅延の影響を受ける期間</span>`);
+  const rangeNote=hasRange?`年フィルター ${range.from||'開始'}〜${range.to||'終了'} は背景で強調し、グラフ自体は全期間を表示しています。`:'グラフは全期間を表示しています。';
+  const undatedNote=Number(summary.undated||0)?` 出願年不明の${Number(summary.undated)}件は棒グラフから除外しています。`:'';
+  const basisNote=applicationYearOnly?'':` 出願日を取得できない文献では、収録年または公開番号から補完した年を使用しています。`;
+  const statusNote=hasStatusBreakdown?'':' 法的状態の内訳は未取得です。PatentViewerを再起動すると3色の内訳が反映されます。';
+  $('#cell-trend-note').textContent=`${rangeNote}${undatedNote}${basisNote} 法的状態は各年当時ではなく現在の状態です。${Number(data.immature_from)}年以降は公開遅延により少なく見える可能性があります。${statusNote}`;
+}
+
+function renderOrganizationTrend(data){
+  const chart=$('#cell-trend-chart'),organizations=data.organizations||[],summary=data.summary||{},top=organizations[0],total=Number(summary.selected_count||0);
+  $('#cell-trend-status').textContent='上位10出願人';
+  $('#cell-trend-total-label').textContent='対象文献';$('#cell-trend-peak-label').textContent='出願人数';$('#cell-trend-recent-label').textContent='首位出願人';$('#cell-trend-direction-label').textContent='首位割合';
+  $('#cell-trend-total').textContent=`${total}件`;$('#cell-trend-peak').textContent=`${Number(data.organization_count||0)}社`;$('#cell-trend-recent').textContent=top?.name||'—';$('#cell-trend-direction').textContent=top?`${(Number(top.share||0)*100).toFixed(1)}%`:'—';
+  chart.className='trend-chart organization-chart';chart.innerHTML='';
+  organizations.forEach((item,index)=>{
+    const row=document.createElement('div'),share=Math.max(0,Math.min(1,Number(item.share||0)));
+    row.className='organization-trend-row';row.setAttribute('aria-label',`${index+1}位、${item.name}、${item.count}件、選択セルの${(share*100).toFixed(1)}%`);
+    row.title=`${item.name}\n${item.count}件 / ${(share*100).toFixed(1)}%\n${trendStatusKeys.map(key=>`${trendStatusLabels[key]} ${Number(item.status_counts?.[key]||0)}件`).join('・')}`;
+    row.innerHTML=`<span class="organization-trend-name">${index+1}. ${escapeHtml(item.name)}</span><span class="organization-trend-track"><span class="organization-trend-stack" style="width:${share*100}%">${trendStatusSegments(item.status_counts)}</span></span><span class="organization-trend-value">${item.count}件 · ${(share*100).toFixed(1)}%</span>`;
+    chart.append(row);
+  });
+  if(!organizations.length)chart.innerHTML='<div class="organization-empty">出願人情報が登録された文献はありません</div>';
+  chart.setAttribute('aria-label',`${$('#cell-trend-title').textContent}の上位出願人構成`);
+  $('#cell-trend-legend').innerHTML=trendStatusLegend();
+  $('#cell-trend-note').textContent='現在の検索・年・法的状態・企業条件に該当する選択セルの文献数を100%として、出願人ごとの割合を表示しています。共同出願は各出願人に1件ずつ数えるため、割合の合計は100%を超える場合があります。';
+}
+
+function setCellTrendMode(mode){
+  if(!['year','organization'].includes(mode))return;state.cellChartMode=mode;renderCellTrendMode();
 }
 
 async function refreshDocuments(reset=true){
@@ -146,9 +258,9 @@ function organizationRankingItems(){
 }
 function renderOrganizationRanking(){
   const panel=$('#organization-panel');if(!panel)return;panel.classList.toggle('hidden',state.view!=='technology');
-  const items=organizationRankingItems(),ranking=$('#organization-ranking');$('#organization-scope').textContent=`現在の表示条件 · ${Number(state.dashboard?.aggregates?.metrics?.total||0)}件`;
+  const items=organizationRankingItems(),ranking=$('#organization-ranking'),total=Number(state.dashboard?.aggregates?.metrics?.total||0);$('#organization-scope').textContent=`現在の表示条件 · ${total}件`;
   ranking.innerHTML='';if(!items.length){ranking.innerHTML=`<div class="organization-empty">${state.organizationMode==='group'?'該当する登録グループがありません':'企業名が登録された文献がありません'}</div>`;return;}
-  items.forEach((item,index)=>{const button=document.createElement('button');button.className='organization-rank';button.classList.toggle('active',state.selectedOrganization?.type===item.type&&state.selectedOrganization?.id===item.id);button.dataset.agentId=`organization-rank-${slug(item.id)}`;button.title=item.name;button.innerHTML=`<span class="rank">${index+1}</span><span class="name">${escapeHtml(item.name)}</span><span class="count">${item.count}</span>`;button.addEventListener('click',()=>selectOrganization(item));ranking.append(button);});
+  items.forEach((item,index)=>{const button=document.createElement('button'),share=total>0?Math.min(1,item.count/total):0;button.className='organization-rank';button.classList.toggle('active',state.selectedOrganization?.type===item.type&&state.selectedOrganization?.id===item.id);button.dataset.agentId=`organization-rank-${slug(item.id)}`;button.style.setProperty('--organization-share',`${share*100}%`);button.title=`${item.name}: ${item.count}件（全体の${(share*100).toFixed(1)}%）`;button.innerHTML=`<span class="rank">${index+1}</span><span class="name">${escapeHtml(item.name)}</span><span class="count">${item.count}</span>`;button.addEventListener('click',()=>selectOrganization(item));ranking.append(button);});
 }
 function selectOrganization(item){state.selectedOrganization=item;if(state.cellFilter)clearCell();else refreshDocuments(true);}
 function clearOrganization(){state.selectedOrganization=null;if(state.cellFilter)clearCell();else refreshDocuments(true);}
@@ -172,8 +284,9 @@ function renderThreatMap() {
     button.dataset.agentId = `threat-cell-${x}-${y}`; button.style.background = density(count,max);
     button.setAttribute('aria-label', `類似度${x}、権利範囲の広さ${y}、${count}件`);
     button.innerHTML = `<strong>${count}</strong><small>${x} × ${y}</small>`;
-    if (state.cellFilter?.type === 'threat' && state.cellFilter.x === x && state.cellFilter.y === y) button.classList.add('selected');
-    button.addEventListener('click', () => selectCell({ type:'threat', x, y, label:`脅威マップ：類似度 ${x} / 権利範囲の広さ ${y}` }));
+    button.disabled=count===0;button.setAttribute('aria-disabled',String(count===0));
+    if (count>0&&state.cellFilter?.type === 'threat' && state.cellFilter.x === x && state.cellFilter.y === y) button.classList.add('selected');
+    if(count>0)button.addEventListener('click', () => selectCell({ type:'threat', x, y, label:`脅威マップ：類似度 ${x} / 権利範囲の広さ ${y}` }));
     map.append(button);
   }
 }
@@ -205,14 +318,15 @@ function renderTechnologyMap() {
   problems.forEach(problem=>{
     const rowLabel=document.createElement('div');const rowGlow=strength(problemMeta,problem);rowLabel.className='map-axis-label row';rowLabel.textContent=problemName(problem);rowLabel.title=`自社の対象課題とのコサイン類似度: ${Number(problemMeta[problem]?.cosine_similarity||0).toFixed(3)}`;rowLabel.style.setProperty('--axis-glow',rowGlow);map.append(rowLabel);
     techs.forEach(tech => {
-      const count=buckets.get(`${tech}|${problem}`)||0,overlayCount=overlayBuckets.get(`${tech}|${problem}`)||0;const button=document.createElement('button');button.className='map-cell';button.dataset.count=count;
+      const count=buckets.get(`${tech}|${problem}`)||0,overlayCount=overlayBuckets.get(`${tech}|${problem}`)||0,interactiveCount=state.selectedOrganization?overlayCount:count;const button=document.createElement('button');button.className='map-cell';button.dataset.count=count;
       const columnGlow=strength(techMeta,tech);button.style.background=density(count,max);button.style.setProperty('--column-glow',columnGlow);button.style.setProperty('--row-glow',rowGlow);
       button.dataset.agentId=`technology-cell-${slug(tech)}-${slug(problem)}`;
       const countLabel=state.selectedOrganization?`${state.selectedOrganization.name} ${overlayCount}件、母集団${count}件`:`${count}件`;
       button.setAttribute('aria-label',`${techName(tech)}、${problemName(problem)}、${countLabel}、自社技術近接度${Math.round(columnGlow*100)}%、自社課題近接度${Math.round(rowGlow*100)}%`);button.title=`技術: ${techName(tech)}\n課題: ${problemName(problem)}\n${countLabel}\n自社技術との類似度: ${Number(techMeta[tech]?.cosine_similarity||0).toFixed(3)}\n自社課題との類似度: ${Number(problemMeta[problem]?.cosine_similarity||0).toFixed(3)}`;
       button.innerHTML=state.selectedOrganization?`<strong class="overlay-count">${overlayCount}</strong><small class="population-count">/ ${count} 母集団</small>`:`<strong>${count}</strong>`;
-      if(state.cellFilter?.type==='technology'&&state.cellFilter.tech===tech&&state.cellFilter.problem===problem)button.classList.add('selected');
-      button.addEventListener('click',()=>selectCell({type:'technology',tech,problem,label:`技術：${techName(tech)} / 課題：${problemName(problem)}${state.selectedOrganization?` / ${state.selectedOrganization.name}`:''}`}));map.append(button);
+      button.disabled=interactiveCount===0;button.setAttribute('aria-disabled',String(interactiveCount===0));
+      if(interactiveCount>0&&state.cellFilter?.type==='technology'&&state.cellFilter.tech===tech&&state.cellFilter.problem===problem)button.classList.add('selected');
+      if(interactiveCount>0)button.addEventListener('click',()=>selectCell({type:'technology',tech,problem,label:`技術：${techName(tech)} / 課題：${problemName(problem)}${state.selectedOrganization?` / ${state.selectedOrganization.name}`:''}`}));map.append(button);
     });
   });
   const hiddenTechs=allTechs.length-techs.length,hiddenProblems=allProblems.length-problems.length;
@@ -221,8 +335,8 @@ function renderTechnologyMap() {
   $('#technology-map-note').textContent=`意味の近い順に配置。背景は母集団の文献量、左右の発光は自社技術との近さ、上下の発光は自社の対象課題との近さです。${overlayNote}${minimum}件未満を非表示（技術 ${hiddenTechs}・課題 ${hiddenProblems}）。`;
 }
 
-function selectCell(filter) { state.cellFilter=filter;$('#clear-cell').classList.remove('hidden');$('#active-filter').classList.remove('hidden');$('#active-filter').textContent=filter.label;refreshDocuments(true); }
-function clearCell() { const changed=!!state.cellFilter;state.cellFilter=null;$('#clear-cell').classList.add('hidden');$('#active-filter').classList.add('hidden');if(changed)refreshDocuments(true);else{renderThreatMap();renderTechnologyMap();renderPatentList();} }
+function selectCell(filter) { state.cellFilter=filter;$('#clear-cell').classList.remove('hidden');$('#active-filter').classList.remove('hidden');$('#active-filter').textContent=filter.label;refreshDocuments(true);refreshCellTrend(); }
+function clearCell() { const changed=!!state.cellFilter;state.cellFilter=null;state.trendRequest++;$('#clear-cell').classList.add('hidden');$('#active-filter').classList.add('hidden');$('#cell-trend-panel').classList.add('hidden');if(changed)refreshDocuments(true);else{renderThreatMap();renderTechnologyMap();renderPatentList();} }
 
 function renderPatentList() {
   const patents=state.visible;const list=$('#patent-list');list.innerHTML='';
@@ -543,7 +657,7 @@ function initSidebarResizer(){
 function changeYearRange(changed){
   const from=$('#year-from'),to=$('#year-to'),fromYear=Number(from.value),toYear=Number(to.value);
   if(fromYear&&toYear&&fromYear>toYear){if(changed===from)to.value=from.value;else from.value=to.value;}
-  clearCell();applyFilters();
+  applyFilters();
 }
 function resetFilters(){ $('#year-from').value='';$('#year-to').value='';$('#search-input').value='';$('#technology-cluster-min-size').value='1';state.techClusterMinSize=1;$$('#legal-status-filters input').forEach(x=>x.checked=true);clearCell();applyFilters(); }
 function setView(view){
@@ -561,6 +675,7 @@ function bindEvents(){
   $('#reset-filters').addEventListener('click',resetFilters);$('#clear-cell').addEventListener('click',clearCell);$('#preview-selected').addEventListener('click',()=>{if(state.selected?.pdf_available)openPdf(state.selected);});$('#pdf-close').addEventListener('click',()=>{$('#pdf-frame').src='about:blank';$('#pdf-dialog').close();});$('#save-note').addEventListener('click',saveNote);$('#debug-toggle').addEventListener('click',toggleEnvironment);$('#preflight-button').addEventListener('click',showPreflight);
   $('#patent-list').addEventListener('scroll',event=>{const list=event.currentTarget;if(list.scrollTop+list.clientHeight>=list.scrollHeight-120)loadMoreDocuments();});
   $('#technology-cluster-min-size').addEventListener('change',event=>{state.techClusterMinSize=Math.max(1,Number(event.target.value)||1);if(state.cellFilter?.type==='technology')clearCell();else renderTechnologyMap();});
+  $$('[data-trend-mode]').forEach(button=>button.addEventListener('click',()=>setCellTrendMode(button.dataset.trendMode)));
   $$('[data-organization-mode]').forEach(button=>button.addEventListener('click',()=>setOrganizationMode(button.dataset.organizationMode)));$('#organization-clear').addEventListener('click',clearOrganization);$('#organization-groups-manage').addEventListener('click',showOrganizationGroups);$('#organization-group-new').addEventListener('click',resetOrganizationGroupForm);$('#organization-group-form').addEventListener('submit',saveOrganizationGroup);$('#organization-group-delete').addEventListener('click',deleteOrganizationGroup);
   $('#pipeline-button').addEventListener('click',()=>openPipelineFrom($('#pipeline-button')));$('#pipeline-refresh').addEventListener('click',()=>loadPipelineResearch(state.pipelineResearchId));$('#pipeline-research-select').addEventListener('change',event=>loadPipelineResearch(event.target.value));$('#pipeline-confirm').addEventListener('change',updatePipelineAction);$('#pipeline-overwrite').addEventListener('change',()=>{$('#pipeline-confirm').checked=false;updatePipelineAction();});$('#pipeline-prepare').addEventListener('click',()=>startPipeline('prepare',$('#pipeline-prepare')));$('#pipeline-execute').addEventListener('click',()=>processPending($('#pipeline-execute')));$('#pipeline-pause').addEventListener('click',()=>controlPipeline('pause'));$('#pipeline-resume').addEventListener('click',()=>controlPipeline('run'));$('#pipeline-cancel').addEventListener('click',()=>controlPipeline('cancel'));
   $('#research-manage-button').addEventListener('click',showResearchManager);$('#research-create-form').addEventListener('submit',createResearch);$('#research-create-csv').addEventListener('change',event=>{if(event.target.files[0])validateCsvFile(event.target.files[0],'#research-create-validation').catch(()=>{});});$('#research-manage-select').addEventListener('change',renderManagedResearch);$('#research-update-submit').addEventListener('click',uploadResearchCsv);$('#research-archive-selected').addEventListener('click',()=>setResearchArchived(true));$('#research-restore-selected').addEventListener('click',()=>setResearchArchived(false));$('#research-open-selected').addEventListener('click',async()=>{const item=selectedManagedResearch();if(!item)return;$('#research-dialog').close();await loadResearches(item.id);});$('#research-create-name').addEventListener('input',event=>{const id=$('#research-create-id');if(!id.dataset.edited){const ascii=event.target.value.normalize('NFKC').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'');id.value=ascii||`research_${new Date().toISOString().replace(/\\D/g,'').slice(0,14)}`;}});$('#research-create-id').addEventListener('input',event=>event.target.dataset.edited='true');

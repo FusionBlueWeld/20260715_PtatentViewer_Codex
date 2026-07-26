@@ -1,0 +1,1 @@
+自社技術定義をresearch.jsonのcompany_technologyから読み、対象、入力、処理、制御対象、目的の5観点で比較する。

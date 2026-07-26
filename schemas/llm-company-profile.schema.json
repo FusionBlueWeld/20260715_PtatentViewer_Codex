@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local LLM company technology map profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["technology_summary", "problem_summary"],
+  "properties": {
+    "technology_summary": {"type": "string", "minLength": 1, "maxLength": 800},
+    "problem_summary": {"type": "string", "minLength": 1, "maxLength": 800}
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local LLM problem summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["problem_summary", "source_paragraph_ids"],
+  "properties": {
+    "problem_summary": {"type": "string", "minLength": 1, "maxLength": 800},
+    "source_paragraph_ids": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 80},
+      "minItems": 1,
+      "maxItems": 4,
+      "uniqueItems": true
+    }
+  }
+}

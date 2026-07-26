@@ -1,0 +1,1 @@
+{"similarity":5,"concept_level":5,"tech_cluster":"品質予測モデル","problem_cluster":"加工後まで欠陥が分からない","tech_summary":"実績データを蓄積し、予測モデルと加工レシピを継続更新する。","problem_summary":"条件最適化が作業者の経験に依存し、改善知識を再利用できない。","reasoning":"データ蓄積からレシピ更新まで自社の中核ループと重なる最優先確認候補です。"}

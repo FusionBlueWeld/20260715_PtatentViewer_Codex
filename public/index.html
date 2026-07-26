@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#414965">
+  <title>PatentViewer</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body data-module="patent-viewer">
+  <a class="skip-link" href="#main">メインへ移動</a>
+  <header class="topbar">
+    <div class="brand" aria-label="PatentViewer">
+      <div class="brand-mark">PV</div>
+      <div><strong>PatentViewer</strong><span>Research Intelligence Workspace</span></div>
+    </div>
+    <div class="view-tabs" role="group" aria-label="マップ切替">
+      <button class="tab active" data-view="threat" data-agent-id="view-threat" aria-pressed="true">脅威マップ</button>
+      <button class="tab" data-view="technology" data-agent-id="view-technology" aria-pressed="false">技術マップ</button>
+    </div>
+    <div class="top-actions">
+      <span id="environment-badge" class="environment-badge">NORMAL</span>
+      <button class="icon-button" id="debug-toggle" data-agent-id="environment-toggle" aria-label="DEBUG環境へ切替">⌁</button>
+      <button class="primary small" id="preflight-button" data-agent-id="llm-preflight">LLM preflight</button>
+      <button class="secondary small" id="pipeline-button" data-agent-id="pipeline-open">夜間一括分析</button>
+    </div>
+  </header>
+
+  <main id="main" class="workspace">
+    <aside class="sidebar" aria-label="調査条件">
+      <section>
+        <p class="eyebrow">RESEARCH SCOPE</p>
+        <label for="research-select">リサーチ</label>
+        <select id="research-select" data-agent-id="research-select"></select>
+        <button class="secondary full research-manage-open" id="research-manage-button" data-agent-id="research-manage-open">リサーチ管理</button>
+      </section>
+
+      <section>
+        <div class="section-title"><span>絞り込み</span><button id="reset-filters" class="text-button" data-agent-id="filters-reset">Reset</button></div>
+        <label for="search-input">文献検索</label>
+        <div class="search-wrap"><input id="search-input" data-agent-id="patent-search" type="search" placeholder="番号・出願人・タイトル"></div>
+        <span class="filter-label">出願年</span>
+        <div class="year-range">
+          <label for="year-from"><span>開始</span><select id="year-from" data-agent-id="year-from-filter"><option value="">指定なし</option></select></label>
+          <span aria-hidden="true">〜</span>
+          <label for="year-to"><span>終了</span><select id="year-to" data-agent-id="year-to-filter"><option value="">指定なし</option></select></label>
+        </div>
+        <fieldset id="legal-status-filters">
+          <legend><span>法的状態</span><button id="legal-status-settings" class="text-button" type="button" data-agent-id="legal-status-settings">判定設定</button></legend>
+          <label class="check-row"><input type="checkbox" value="rights_acquired" checked data-agent-id="status-rights-acquired"><span>権利化</span><i class="dot rights-acquired"></i></label>
+          <label class="check-row"><input type="checkbox" value="under_examination" checked data-agent-id="status-under-examination"><span>審査中</span><i class="dot under-examination"></i></label>
+          <label class="check-row"><input type="checkbox" value="published" checked data-agent-id="status-published"><span>公開</span><i class="dot published"></i></label>
+        </fieldset>
+      </section>
+
+      <section id="organization-panel" class="hidden" aria-label="企業分布">
+        <div class="section-title"><span>企業分布</span><button id="organization-clear" class="text-button" data-agent-id="organization-clear">全企業</button></div>
+        <div class="organization-mode" role="group" aria-label="企業集計単位">
+          <button class="active" data-organization-mode="organization" aria-pressed="true">法人別</button>
+          <button data-organization-mode="group" aria-pressed="false">グループ別</button>
+        </div>
+        <p id="organization-scope" class="organization-scope">現在の表示条件 · 0件</p>
+        <div id="organization-ranking" class="organization-ranking"></div>
+        <button class="secondary full" id="organization-groups-manage" data-agent-id="organization-groups-manage">企業グループを管理</button>
+      </section>
+
+      <section class="sidebar-foot">
+        <div class="pool-stat"><span>PDF POOL</span><strong id="pool-count">—</strong><small>共有・読み取り専用</small></div>
+        <button class="secondary full" id="bridge-open" data-agent-id="bridge-open">Codex collaboration</button>
+      </section>
+    </aside>
+
+    <div id="sidebar-resizer" class="sidebar-resizer" role="separator" aria-label="サイドバーの幅を調整" aria-orientation="vertical" aria-valuemin="180" aria-valuemax="500" aria-valuenow="250" tabindex="0" data-agent-id="sidebar-resizer">
+      <span class="sidebar-resizer-grip" aria-hidden="true"><i></i><i></i><i></i></span>
+    </div>
+
+    <div class="content">
+      <section class="hero-card">
+        <div>
+          <p class="eyebrow">ACTIVE RESEARCH</p>
+          <h1 id="research-title">Patent landscape</h1>
+          <p id="research-description">リサーチを読み込んでいます…</p>
+        </div>
+      </section>
+
+      <section class="metrics" aria-label="集計指標">
+        <article class="metric"><span>表示文献</span><strong id="metric-visible">0</strong><small id="metric-total">/ 0 total</small></article>
+        <article class="metric"><span>分析済み</span><strong id="metric-ready">0</strong><small>pendingは評価から除外</small></article>
+        <article class="metric"><span>権利化比率</span><strong id="metric-registered">0%</strong><div class="mini-progress"><i id="registered-bar"></i></div></article>
+        <article class="metric accent"><span>高脅威候補</span><strong id="metric-threat">0</strong><small>類似度4+ / 権利範囲の広さ4+</small></article>
+      </section>
+
+      <section class="map-grid single-map">
+        <article class="panel map-panel" id="threat-panel">
+          <header class="panel-head"><div><p class="eyebrow">SIMILARITY × SCOPE</p><h2>脅威マップ</h2></div><span class="legend"><i></i>件数密度</span></header>
+          <div class="axis-layout">
+            <span class="y-axis">権利範囲の広さ →</span>
+            <div id="threat-map" class="map threat-map" role="grid" aria-label="脅威マップ"></div>
+            <span class="x-axis">自社技術との類似度 →</span>
+          </div>
+          <p class="map-note">分析済み文献のみ。セルを選ぶと該当文献を一覧表示します。</p>
+        </article>
+
+        <article class="panel map-panel" id="technology-panel">
+          <header class="panel-head"><div><p class="eyebrow">PROBLEM × SOLUTION</p><h2>技術マップ</h2></div><div class="technology-map-controls"><label for="technology-cluster-min-size">最小クラスタ件数</label><select id="technology-cluster-min-size" data-agent-id="technology-cluster-min-size"><option value="1">1件以上（すべて）</option><option value="2">2件以上</option><option value="3">3件以上</option><option value="5">5件以上</option><option value="10">10件以上</option></select><span id="cluster-count" class="status-pill">0 clusters</span></div></header>
+          <div class="axis-layout tech-axis">
+            <span class="y-axis">技術的課題 →</span>
+            <div id="technology-map" class="map technology-map" role="grid" aria-label="技術マップ"></div>
+            <span class="x-axis">発明技術 →</span>
+          </div>
+          <p id="technology-map-note" class="map-note">意味の近いクラスタを隣接配置し、背景で文献量、セルのエッジで自社との近さを表示します。</p>
+        </article>
+      </section>
+
+      <section id="cell-trend-panel" class="panel trend-panel hidden" aria-live="polite">
+        <header class="panel-head">
+          <div><p class="eyebrow">CELL INSIGHT</p><h2 id="cell-trend-title">選択セルの分析</h2></div>
+          <div class="trend-panel-controls"><div class="trend-view-tabs" role="group" aria-label="セルグラフ切替"><button class="active" data-trend-mode="year" aria-pressed="true">年次推移</button><button data-trend-mode="organization" aria-pressed="false">出願人構成</button></div><span id="cell-trend-status" class="status-pill">出願年基準</span></div>
+        </header>
+        <div id="cell-trend-loading" class="trend-loading">セル情報を集計しています…</div>
+        <div id="cell-trend-content" class="hidden">
+          <div class="trend-summary">
+            <span><small id="cell-trend-total-label">累計件数</small><b id="cell-trend-total">0</b></span>
+            <span><small id="cell-trend-peak-label">ピーク年</small><b id="cell-trend-peak">—</b></span>
+            <span><small id="cell-trend-recent-label">直近3年</small><b id="cell-trend-recent">0</b></span>
+            <span><small id="cell-trend-direction-label">傾向</small><b id="cell-trend-direction">—</b></span>
+          </div>
+          <div id="cell-trend-chart" class="trend-chart" role="img" aria-label="選択セルのグラフ"></div>
+          <div id="cell-trend-legend" class="trend-legend"></div>
+          <p id="cell-trend-note" class="map-note"></p>
+        </div>
+        <div id="cell-trend-error" class="trend-error hidden"></div>
+      </section>
+
+      <section class="lower-grid">
+        <article class="panel patent-list-panel">
+          <header class="panel-head"><div><p class="eyebrow">LINKED DOCUMENTS</p><h2>対象文献</h2></div><button id="clear-cell" class="text-button hidden" data-agent-id="cell-filter-clear">セル選択を解除</button></header>
+          <div id="active-filter" class="active-filter hidden"></div>
+          <div id="patent-list" class="patent-list" aria-live="polite"></div>
+        </article>
+
+        <article class="panel interpretation-panel">
+          <header class="panel-head"><div><p class="eyebrow">HUMAN + CODEX</p><h2>分析・解釈</h2></div><span id="selected-status" class="status-pill">文献未選択</span></header>
+          <div id="interpretation-empty" class="empty-state"><div class="empty-icon">◎</div><strong>文献を選択してください</strong><p>要約、評価根拠、PDF、調査メモをここで横断確認できます。</p></div>
+          <div id="interpretation-content" class="hidden">
+            <h3 id="selected-title"></h3>
+            <p id="selected-number" class="muted"></p>
+            <div class="score-row"><span>類似度 <b id="selected-similarity">—</b></span><span>権利範囲の広さ <b id="selected-concept">—</b></span></div>
+            <dl class="summary-list"><dt>技術要約</dt><dd id="selected-tech-summary"></dd><dt>課題要約</dt><dd id="selected-problem-summary"></dd><dt>評価の読み方</dt><dd id="selected-reasoning"></dd><dt id="selected-evidence-label" class="hidden">原文トレース</dt><dd id="selected-evidence" class="claim-evidence hidden"></dd></dl>
+            <label for="interpretation-note">調査メモ / Codex解釈</label>
+            <textarea id="interpretation-note" rows="5" data-agent-id="interpretation-note" placeholder="比較観点、権利範囲、次に確認する請求項など"></textarea>
+            <div class="button-row"><button id="save-note" class="primary" data-agent-id="interpretation-save">保存</button><button id="preview-selected" class="secondary" data-agent-id="selected-pdf-preview">PDFプレビュー</button></div>
+            <p id="save-feedback" class="feedback" aria-live="polite"></p>
+          </div>
+        </article>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="pdf-dialog" class="pdf-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">SOURCE DOCUMENT</p><h2 id="pdf-title">PDF</h2></div><div class="button-row"><a id="pdf-new-tab" class="secondary button-link" target="_blank" rel="noopener">別タブ</a><button id="pdf-close" class="icon-button" data-agent-id="pdf-close" aria-label="閉じる">×</button></div></div>
+    <iframe id="pdf-frame" title="特許PDFプレビュー"></iframe>
+  </dialog>
+
+  <dialog id="claim-dialog" class="compact-dialog claim-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">VERIFIED SOURCE</p><h2 id="claim-dialog-title">請求項</h2></div><button class="icon-button" data-close-dialog="claim-dialog" aria-label="閉じる">×</button></div>
+    <p id="claim-dialog-meta" class="muted"></p>
+    <pre id="claim-dialog-text" class="claim-source-text"></pre>
+  </dialog>
+
+  <dialog id="preflight-dialog" class="compact-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">NO MODEL EXECUTION</p><h2>Local LLM preflight</h2></div><button class="icon-button" data-close-dialog="preflight-dialog" aria-label="閉じる">×</button></div>
+    <p>この診断はアプリ専用Ollamaへの接続条件を確認します。モデル推論は実行しません。</p>
+    <div id="preflight-results" class="check-list"></div>
+  </dialog>
+
+  <dialog id="research-dialog" class="compact-dialog research-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">RESEARCH LIFECYCLE</p><h2>リサーチ管理</h2></div><button class="icon-button" data-close-dialog="research-dialog" aria-label="閉じる">×</button></div>
+    <div class="research-dialog-grid">
+      <form id="research-create-form">
+        <h3>新しいリサーチ</h3>
+        <label for="research-create-name">リサーチ名</label>
+        <input id="research-create-name" maxlength="120" required placeholder="例：次世代レーザー加工調査">
+        <label for="research-create-id">リサーチID</label>
+        <input id="research-create-id" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" required placeholder="laser_2026">
+        <label for="research-create-description">説明</label>
+        <textarea id="research-create-description" rows="3" maxlength="2000"></textarea>
+        <label for="research-create-company-tech">自社技術定義</label>
+        <textarea id="research-create-company-tech" rows="6" maxlength="20000" required placeholder="対象、入力、処理、制御対象、目的・効果を記載"></textarea>
+        <label for="research-create-csv">特許リストCSV</label>
+        <input id="research-create-csv" type="file" accept=".csv" required>
+        <div id="research-create-validation" class="csv-validation muted">CSVを選択すると事前検証します。</div>
+        <button id="research-create-submit" class="primary full" type="submit">検証して作成</button>
+        <p id="research-create-feedback" class="feedback" aria-live="polite"></p>
+      </form>
+      <section>
+        <h3>既存リサーチ</h3>
+        <label for="research-manage-select">対象リサーチ</label>
+        <select id="research-manage-select"></select>
+        <div id="research-manage-summary" class="research-manage-summary"></div>
+        <label for="research-update-csv">新しい特許リストCSV</label>
+        <input id="research-update-csv" type="file" accept=".csv">
+        <button id="research-update-submit" class="secondary full" type="button">CSVを検証して追加</button>
+        <p id="research-update-feedback" class="feedback" aria-live="polite"></p>
+        <div class="button-row">
+          <button id="research-open-selected" class="secondary" type="button">開く</button>
+          <button id="research-archive-selected" class="danger" type="button">アーカイブ</button>
+          <button id="research-restore-selected" class="primary hidden" type="button">復元</button>
+        </div>
+      </section>
+    </div>
+  </dialog>
+
+  <dialog id="legal-status-dialog" class="compact-dialog legal-status-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">EXACT MATCH RULES</p><h2>法的状態の判定設定</h2></div><button class="icon-button" data-close-dialog="legal-status-dialog" aria-label="閉じる">×</button></div>
+    <p class="muted">CSVの「ステイタス」と完全一致したテキストを分類します。どちらにも一致しない文献はすべて「公開」です。</p>
+    <div class="legal-rule-grid">
+      <section>
+        <h3><i class="dot rights-acquired"></i> 権利化</h3>
+        <div id="rights-acquired-tags" class="tag-editor" data-category="rights_acquired">
+          <div class="tag-chips"></div>
+          <input id="rights-acquired-input" type="text" maxlength="200" placeholder="テキストを入力して Enter または ,">
+        </div>
+      </section>
+      <section>
+        <h3><i class="dot under-examination"></i> 審査中</h3>
+        <div id="under-examination-tags" class="tag-editor" data-category="under_examination">
+          <div class="tag-chips"></div>
+          <input id="under-examination-input" type="text" maxlength="200" placeholder="テキストを入力して Enter または ,">
+        </div>
+      </section>
+      <section class="published-fallback">
+        <h3><i class="dot published"></i> 公開</h3>
+        <p>権利化・審査中のどちらにも完全一致しないステイタスを自動分類します。</p>
+      </section>
+    </div>
+    <div id="legal-status-preview" class="legal-status-preview"></div>
+    <div class="button-row dialog-actions"><button id="legal-status-save" class="primary" type="button" data-agent-id="legal-status-save">保存して反映</button></div>
+    <p id="legal-status-feedback" class="feedback" aria-live="polite"></p>
+  </dialog>
+
+  <dialog id="pipeline-dialog" class="compact-dialog pipeline-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">LOCAL LLM · CODEX不要</p><h2>夜間一括分析</h2></div><button class="icon-button" data-close-dialog="pipeline-dialog" aria-label="閉じる">×</button></div>
+    <p class="pipeline-description">CSVリストの未処理PDFを、VRAMから自動調整した専用Ollamaでタスク別にバッチ分析します。冷却中もモデルを保持し、途中停止後はタスク単位の成果物を再利用します。</p>
+    <div class="pipeline-research-picker">
+      <label for="pipeline-research-select">分析するリサーチ</label>
+      <select id="pipeline-research-select" data-agent-id="pipeline-research-select"></select>
+    </div>
+    <p id="pipeline-policy" class="muted">リサーチ設定を読み込んでいます。</p>
+    <div id="pipeline-counts" class="pipeline-counts"></div>
+    <p class="pipeline-stage-heading">バッチ全体</p>
+    <div id="pipeline-stages" class="pipeline-stages pipeline-overall-stages"></div>
+    <div class="pipeline-actions">
+      <button id="pipeline-refresh" class="secondary small" data-agent-id="pipeline-refresh">状態更新</button>
+      <button id="pipeline-prepare" class="secondary small" data-agent-id="pipeline-prepare">前処理だけ実行</button>
+    </div>
+    <div class="pipeline-setting">
+      <label for="pipeline-cooldown-seconds"><span>冷却時間</span><small>生成バッチ間。0で待機なし</small></label>
+      <div><input id="pipeline-cooldown-seconds" data-agent-id="pipeline-cooldown-seconds" type="number" min="0" max="180" step="1" value="0"><span>秒</span></div>
+    </div>
+    <label class="pipeline-overwrite"><input id="pipeline-overwrite" type="checkbox" data-agent-id="pipeline-overwrite"><span><b>全件を再分析</b><small>既存結果を削除せず、文献分析・Embedding・クラスタをすべて更新します</small></span></label>
+    <label class="pipeline-confirm"><input id="pipeline-confirm" type="checkbox" data-agent-id="pipeline-execute-confirm"> <span id="pipeline-confirm-text">未処理PDFをローカルLLMでバッチ処理することを確認しました</span></label>
+    <button id="pipeline-execute" class="primary full" data-agent-id="pipeline-execute" disabled>夜間一括分析を開始</button>
+    <div id="pipeline-job" class="pipeline-job hidden" aria-live="polite">
+      <div class="section-title"><strong id="pipeline-job-state">待機</strong><span id="pipeline-job-progress"></span></div>
+      <div class="pipeline-progress" role="progressbar" aria-label="文献分析の進捗" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="pipeline-progress-bar"></i></div>
+      <p id="pipeline-progress-label" class="pipeline-progress-label">開始待ち</p>
+      <div id="pipeline-timing-summary" class="pipeline-timing-summary"><span><small>総経過</small><b>0:00</b></span><span><small>現在工程</small><b>0:00</b></span><span><small>推定残り</small><b>—</b></span></div>
+      <div id="pipeline-phase-times" class="pipeline-phase-times" aria-label="工程別所要時間"></div>
+      <div id="pipeline-live-counts" class="pipeline-live-counts"></div>
+      <p class="pipeline-stage-heading">現在文献の処理（4回の生成 + Embedding）</p>
+      <div id="pipeline-document-stages" class="pipeline-stages pipeline-document-stages"></div>
+      <div class="button-row">
+        <button id="pipeline-pause" class="secondary small" data-agent-id="pipeline-job-pause">Pause</button>
+        <button id="pipeline-resume" class="secondary small" data-agent-id="pipeline-job-resume">Resume</button>
+        <button id="pipeline-cancel" class="danger small" data-agent-id="pipeline-job-cancel">Cancel</button>
+      </div>
+      <pre id="pipeline-job-detail"></pre>
+    </div>
+  </dialog>
+
+  <dialog id="organization-dialog" class="compact-dialog organization-dialog">
+    <div class="dialog-head"><div><p class="eyebrow">ORGANIZATION MASTER</p><h2>企業グループ管理</h2></div><button class="icon-button" data-close-dialog="organization-dialog" aria-label="閉じる">×</button></div>
+    <p class="muted">原文企業名は変更せず、集計上のグループだけを登録します。</p>
+    <div class="organization-dialog-grid">
+      <section>
+        <div class="section-title"><strong>登録済みグループ</strong><button id="organization-group-new" class="text-button">新規</button></div>
+        <div id="organization-group-list" class="organization-group-list"></div>
+      </section>
+      <form id="organization-group-form">
+        <input id="organization-group-id" type="hidden">
+        <label for="organization-group-name">グループ名</label>
+        <input id="organization-group-name" maxlength="100" required placeholder="例：Aグループ">
+        <label for="organization-group-scope">適用範囲</label>
+        <select id="organization-group-scope"><option value="common">全リサーチ共通</option><option value="research">このリサーチだけ</option></select>
+        <label for="organization-group-note">根拠メモ</label>
+        <textarea id="organization-group-note" rows="3" maxlength="2000" placeholder="子会社化、社名変更、確認資料など"></textarea>
+        <label class="group-verified"><input id="organization-group-verified" type="checkbox"> 関係を確認済み</label>
+        <fieldset class="organization-members"><legend>構成企業（2社以上）</legend><div id="organization-member-list"></div></fieldset>
+        <div class="button-row"><button class="primary" type="submit" data-agent-id="organization-group-save">保存</button><button id="organization-group-delete" class="danger hidden" type="button">削除</button></div>
+        <p id="organization-group-feedback" class="feedback" aria-live="polite"></p>
+      </form>
+    </div>
+  </dialog>
+
+  <aside id="bridge-panel" class="bridge-panel" aria-label="Codex collaboration status">
+    <header><div><span class="bridge-dot"></span><div><strong>CODEX UI BRIDGE</strong><small id="bridge-state">READY</small></div></div><button id="bridge-close" class="icon-button" aria-label="閉じる">×</button></header>
+    <p id="bridge-intent">可視UIの操作を待っています</p>
+    <div class="bridge-progress"><i id="bridge-progress"></i></div>
+    <div id="bridge-step">0 / 0</div>
+    <div id="bridge-log" class="bridge-log"></div>
+    <footer><button id="bridge-pause" class="secondary small" data-agent-id="bridge-pause">Pause</button><button id="bridge-resume" class="secondary small" data-agent-id="bridge-resume">Resume</button><button id="bridge-cancel" class="danger small" data-agent-id="bridge-cancel">Cancel</button></footer>
+  </aside>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/assets/whitespace-analysis.js"></script>
+  <script type="module" src="/assets/app.js"></script>
+  <script type="module" src="/assets/agent-bridge.js"></script>
+</body>
+</html>

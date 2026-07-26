@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PatentViewer Collaboration Command",
+  "type": "object",
+  "required": ["actor", "intent", "targetClientId", "actions"],
+  "properties": {
+    "actor": {"const": "codex"},
+    "intent": {"type": "string", "minLength": 1, "maxLength": 500},
+    "targetClientId": {"type": "string", "minLength": 1, "maxLength": 100},
+    "block": {"type": ["string", "null"]},
+    "blockArguments": {"type": "object"},
+    "idempotencyKey": {"type": ["string", "null"], "maxLength": 200},
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": {"enum": ["click", "input", "check", "keydown", "select", "wait", "assert"]},
+          "target": {
+            "type": "object",
+            "properties": {
+              "agentId": {"type": "string"},
+              "selector": {"type": "string"}
+            },
+            "minProperties": 1
+          },
+          "value": {},
+          "key": {"type": "string"},
+          "ms": {"type": "integer", "minimum": 0, "maximum": 10000},
+          "equals": {},
+          "includes": {},
+          "attribute": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

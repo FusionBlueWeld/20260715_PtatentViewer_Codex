@@ -1,0 +1,12 @@
+{
+  "name": "DEBUGレーザー文献",
+  "description": "リサーチ直下で管理するDEBUG fixture",
+  "patents": [
+    {"pdf":"特開2025-184591.pdf","title":"ビームプロファイル可変加工","applicant":"Debug Beam","category":"競合A","tags":["ビーム","2025"]},
+    {"pdf":"特開2024-172352.pdf","title":"加工欠陥予測と品質判定","applicant":"Debug Quality","category":"競合C","tags":["品質","AI"]},
+    {"pdf":"特許第7792585号.pdf","year":2025,"title":"レーザー加工条件の学習更新装置","applicant":"Debug Learning","category":"競合B","tags":["登録","学習"]},
+    {"pdf":"特開2026-70800.pdf","title":"加工状態の光学センシングと出力補正","applicant":"Debug Optics","category":"競合A","tags":["センシング","制御"]},
+    {"pdf":"特開2026-69331.pdf","title":"溶融池推定によるレーザー条件制御","applicant":"Debug Laser","category":"競合B","tags":["状態推定","閉ループ"]},
+    {"pdf":"特許第7843458号.pdf","year":2026,"title":"加工装置および監視制御方法","applicant":"Debug Systems","category":"自社候補","tags":["登録","監視"]}
+  ]
+}

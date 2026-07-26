@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PatentViewer research clustering",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["scope", "research_id", "algorithm", "technology_assignments", "problem_assignments"],
+  "properties": {
+    "scope": {"const": "research"},
+    "technology_assignments": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+    "problem_assignments": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}
+  }
+}

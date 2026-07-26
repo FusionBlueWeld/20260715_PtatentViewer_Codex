@@ -1,0 +1,1 @@
+{"similarity":3,"concept_level":4,"tech_cluster":"工程監視・異常検知","problem_cluster":"異常を早期検出できない","tech_summary":"複数の監視信号を統合して異常判定し、加工を停止または補正する。","problem_summary":"単一信号では異常兆候と外乱を区別しにくい。","reasoning":"監視部分は関連する一方、制御対象の一致範囲は請求項精査が必要です。"}

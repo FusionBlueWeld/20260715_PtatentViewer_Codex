@@ -23,11 +23,16 @@ def main():
     sys.path.insert(0, str(ROOT / "src"))
     from patent_viewer.domain import Repository
     repo = Repository(ROOT)
-    for environment in ("normal", "debug"):
-        researches = repo.list_researches(environment)
-        if not researches: raise SystemExit(f"{environment}: research fixture missing")
-        for research in researches: repo.dashboard(environment, research["id"])
-        print(f"  {environment}: {len(researches)} research(es) OK")
+    normal_researches = repo.list_researches("normal")
+    for research in normal_researches:
+        repo.dashboard("normal", research["id"])
+    print(f"  normal: {len(normal_researches)} local research(es) OK")
+    debug_researches = repo.list_researches("debug")
+    if not debug_researches:
+        raise SystemExit("debug: synthetic research fixture missing")
+    for research in debug_researches:
+        repo.dashboard("debug", research["id"])
+    print(f"  debug: {len(debug_researches)} research fixture(s) OK")
     print("[3/4] responsive screenshot regression")
     visual = subprocess.run([sys.executable, "-X", "utf8", "tools/ui_visual_check.py"], cwd=ROOT)
     if visual.returncode: return visual.returncode

@@ -10,6 +10,7 @@ ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from patent_viewer.collaboration_client import PatentViewerClient
+from synthetic_fixture import synthetic_debug_pdfs
 
 
 TERMINAL = {"completed", "failed", "cancelled"}
@@ -81,46 +82,49 @@ def main() -> int:
     original_environment = browser["environment"]
     completed: list[dict] = []
     restored = False
-    try:
-        if original_environment != "debug":
-            client.switch_environment(client_id, "debug")
-            wait_environment(client, client_id, "debug")
+    with synthetic_debug_pdfs(ROOT):
+        try:
+            if original_environment != "debug":
+                client.switch_environment(client_id, "debug")
+                wait_environment(client, client_id, "debug")
 
-        researches = client.researches("debug")["items"]
-        if not researches:
-            raise RuntimeError("DEBUG research fixtureがありません")
-        research_id = researches[0]["id"]
-        dashboard = client.dashboard(research_id, "debug")
-        patents = dashboard.get("patents", [])
-        if not patents:
-            raise RuntimeError("DEBUG文献がありません")
+            researches = client.researches("debug")["items"]
+            if not researches:
+                raise RuntimeError("DEBUG research fixtureがありません")
+            research_id = researches[0]["id"]
+            dashboard = client.dashboard(research_id, "debug")
+            patents = dashboard.get("patents", [])
+            if not patents:
+                raise RuntimeError("DEBUG文献がありません")
 
-        marker = "__codex_bridge_smoke__"
-        completed.append(execute(client, client_id, "set_filters", {"query": marker}, "Browser smoke: filter"))
-        completed.append(execute(client, client_id, "reset_filters", {}, "Browser smoke: restore filters"))
+            marker = "__codex_bridge_smoke__"
+            completed.append(execute(client, client_id, "set_filters", {"query": marker}, "Browser smoke: filter"))
+            completed.append(execute(client, client_id, "reset_filters", {}, "Browser smoke: restore filters"))
 
-        ready = next((item for item in patents if item.get("analysis_state") == "ready"), None)
-        if ready:
+            ready = next((item for item in patents if item.get("analysis_state") == "ready"), None)
+            if not ready:
+                raise RuntimeError("分析済みの合成DEBUG文献がありません")
             completed.append(execute(client, client_id, "select_threat_cell", {
                 "similarity": int(ready["similarity"]), "concept_level": int(ready["concept_level"]),
             }, "Browser smoke: threat cell"))
             completed.append(execute(client, client_id, "open_patent", {
                 "patent_id": ready["id"],
             }, "Browser smoke: patent detail"))
-            if ready.get("pdf_available"):
-                completed.append(execute(client, client_id, "preview_pdf", {}, "Browser smoke: PDF preview"))
-                completed.append(execute(client, client_id, "close_pdf", {}, "Browser smoke: close PDF"))
+            if not ready.get("pdf_available"):
+                raise RuntimeError("合成DEBUG PDFが利用できません")
+            completed.append(execute(client, client_id, "preview_pdf", {}, "Browser smoke: PDF preview"))
+            completed.append(execute(client, client_id, "close_pdf", {}, "Browser smoke: close PDF"))
 
-        completed.append(execute(client, client_id, "open_preflight", {}, "Browser smoke: preflight dialog"))
-    finally:
-        try:
-            execute(client, client_id, "reset_filters", {}, "Browser smoke: final filter restore")
-        except Exception:
-            pass
-        if original_environment != "debug":
-            client.switch_environment(client_id, original_environment)
-            wait_environment(client, client_id, original_environment)
-        restored = True
+            completed.append(execute(client, client_id, "open_preflight", {}, "Browser smoke: preflight dialog"))
+        finally:
+            try:
+                execute(client, client_id, "reset_filters", {}, "Browser smoke: final filter restore")
+            except Exception:
+                pass
+            if original_environment != "debug":
+                client.switch_environment(client_id, original_environment)
+                wait_environment(client, client_id, original_environment)
+            restored = True
 
     print(json.dumps({
         "ok": True,

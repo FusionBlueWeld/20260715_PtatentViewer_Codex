@@ -8,6 +8,20 @@
 
 ローカルの `patent_pool/` を共有PDF格納庫として、リサーチ単位の特許マップ、PDFプレビュー、解釈メモ、人間とCodexの可視UI協働を提供するHTMLベースのPatentViewerです。
 
+## 新しい環境でCodexに依頼する
+
+GitHubからcloneしたプロジェクトフォルダをCodexのワークスペースとして開き、次の一文を依頼できます。
+
+> このシステムを実行できる環境を立ち上げてください。
+
+ルートの [`AGENTS.md`](AGENTS.md) は、この依頼を単なるサーバー起動ではなく、移行ランブックに沿った初回構築として扱うようCodexへ指示します。Python依存、空のSQLite、PatentViewer起動、ブラウザ、Ollamaとモデル、端末固有MCP設定、doctor、テスト、受入確認までが対象です。システムソフトウェアの導入、ネットワークダウンロード、GUI起動、Codex再接続などに承認や人の操作が必要な場合、Codexは完了済み項目と正確な残作業を報告します。
+
+初回構築では本番PDF、CSV、自社技術定義を登録せず、NORMALリサーチ0件・文献0件を正常状態とします。本番データの登録と一括LLM分析は別途明示的に依頼してください。
+
+`AGENTS.md` を自動読込しない環境では、代わりに次を依頼してください。
+
+> `docs/ENVIRONMENT_MIGRATION_RUNBOOK.md` を最後まで読み、Phase 0から順番に実施してください。PatentViewerの起動、Python依存関係、Ollamaと必要モデル、空のSQLite、MCP設定、doctor、テスト、ブラウザ確認まで完了させ、未完了項目と人の対応が必要な項目を報告してください。本番PDF・CSV・リサーチデータはまだ投入しないでください。
+
 ## 現在できること
 
 - `researches/<research>/patent_list_{yyyymmddHHMMSS}.csv` のCP932直接取込（最新1件）

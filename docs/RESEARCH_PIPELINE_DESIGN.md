@@ -149,16 +149,16 @@ LLMの各要求・応答は文献別の `attempts/<run-id>/llm_calls/` に監査
 
 ```powershell
 # 計画だけを作り、PDFやLLMには触れない
-python tools/run_research_pipeline.py laser_process_landscape --stage plan
+python tools/run_research_pipeline.py <research_id> --stage plan
 
 # 共有抽出、章・請求項分割、読取判断まで
-python tools/run_research_pipeline.py laser_process_landscape --stage prepare
+python tools/run_research_pipeline.py <research_id> --stage prepare
 
 # Ollama段階分析、Embedding、リサーチ全体クラスタ、UI結果確定まで
-python tools/run_research_pipeline.py laser_process_landscape --stage execute
+python tools/run_research_pipeline.py <research_id> --stage execute
 ```
 
-UIの一括分析ではアプリ専用Ollamaを空きローカルポートで管理する。GPU名ではなく、総VRAM、空きVRAM、予約領域、モデルとKVキャッシュの見積りから生成並列数、Embeddingバッチ数、冷却間隔を決定する。GPUが20GB以上かつCPUメモリが64GB以上の環境では本番向け永続シャードモードを自動選択する。このモードでは500件単位で生成とEmbeddingを完了して文献別成果物を永続化し、モデルと文献構造のメモリ参照を解放する。全シャード完了後に保存済みEmbeddingを再読込し、リサーチ全体を母集団として一度だけクラスタリング・命名する。それ未満の環境では、現行テスト機と同じく全対象の生成をタスク別にまとめ、生成完了後に一度だけEmbeddingモデルへ切り替える。`--cooldown-seconds` の待機は一定文献相当の生成呼出しごとに行う。文献別 `analysis_progress.json` に完了タスクを保存し、停止・障害後は未完了タスクだけを再実行する。文献固有のJSON生成・Schema検証・Embedding検証エラーは `analysis_error.json` に記録し、その文献だけを当該runでスキップする。キャンセル、Ollama接続障害、全体クラスタリング障害は文献スキップへ変換せず、全体を停止する。実行履歴は最新5件とするが、文献別の実行監査はrun IDごとに保持する。500件を超える集合は全ペア距離を作らず、固定射影とMiniBatch cosine K-meansでクラスタリングする。
+UIの一括分析ではアプリ専用Ollamaを空きローカルポートで管理する。GPU名ではなく、総VRAM、空きVRAM、予約領域、モデルとKVキャッシュの見積りから生成並列数、Embeddingバッチ数、冷却間隔を決定する。GPUが20GB以上かつCPUメモリが64GB以上の環境では本番向け永続シャードモードを自動選択する。このモードでは500件単位で生成とEmbeddingを完了して文献別成果物を永続化し、モデルと文献構造のメモリ参照を解放する。全シャード完了後に保存済みEmbeddingを再読込し、リサーチ全体を母集団として一度だけクラスタリング・命名する。それ未満の環境では、全対象の生成をタスク別にまとめ、生成完了後に一度だけEmbeddingモデルへ切り替える。`--cooldown-seconds` の待機は一定文献相当の生成呼出しごとに行う。文献別 `analysis_progress.json` に完了タスクを保存し、停止・障害後は未完了タスクだけを再実行する。文献固有のJSON生成・Schema検証・Embedding検証エラーは `analysis_error.json` に記録し、その文献だけを当該runでスキップする。キャンセル、Ollama接続障害、全体クラスタリング障害は文献スキップへ変換せず、全体を停止する。実行履歴は最新5件とするが、文献別の実行監査はrun IDごとに保持する。500件を超える集合は全ペア距離を作らず、固定射影とMiniBatch cosine K-meansでクラスタリングする。
 
 既存のUI結果を意図して置換する場合だけ `--overwrite` を付ける。通常リサーチ全件の前にDEBUGの少数文献で、類似度と権利範囲の広さの理由が独立請求項と整合すること、5×5の説明可能性、技術／課題要約の混同がないことを人が承認する。
 

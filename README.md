@@ -54,7 +54,7 @@ python tools/patent_viewer.py doctor
 
 別デバイスではclone後に同じ3コマンドを実行します。デバイス固有のPythonパスとMCP設定は `.codex/mcp.local.json`、実行ごとの接続トークンは `runtime/server-control.json` に生成され、Gitには保存されません。UIだけを軽く使用する場合は `start --no-managed-ollama` を指定できます。詳細は [Codex collaboration設計](docs/CODEX_COLLABORATION.md) を参照してください。
 
-本番端末を構築する場合は、[環境移行・本番初回構築ランブック](docs/ENVIRONMENT_MIGRATION_RUNBOOK.md) を使用します。NORMALリサーチ入力を含まない専用releaseから完全な空環境を作る場合だけ、[本番端末の新規構築手順](docs/PRODUCTION_BOOTSTRAP.md) の追加条件も使用します。開発端末のDB、runtime、分析結果は本番へ移行しません。
+本番端末を構築する場合は、[環境移行・本番初回構築ランブック](docs/ENVIRONMENT_MIGRATION_RUNBOOK.md) を使用します。[本番端末の新規構築手順](docs/PRODUCTION_BOOTSTRAP.md) はデータ境界の要約です。GitにはNORMALリサーチ入力を含めず、開発端末のPDF、DB、runtime、分析結果も本番へ移行しません。
 
 ローカルLLM検証を含むPython依存パッケージは次で導入できます。
 
@@ -68,7 +68,7 @@ python -m pip install -r requirements.txt
 powershell -ExecutionPolicy Bypass -File .\scripts\debug.ps1
 ```
 
-このコマンドはunit、API、NORMAL/DEBUG分離、Bridgeプロトコル契約、実データマニフェスト、wide/narrow画像回帰、可視ブラウザの全Semantic Block smokeを検査します。可視ブラウザが接続されていない場合は成功扱いにせず停止します。ブラウザ確認だけを明示的に省略する場合は `python tools/debug_check.py --allow-browser-skip` を使用します。
+このコマンドはunit、API、NORMAL/DEBUG分離、Bridgeプロトコル契約、合成DEBUG fixture、wide/narrow画像回帰、可視ブラウザの全Semantic Block smokeを検査します。可視ブラウザが接続されていない場合は成功扱いにせず停止します。ブラウザ確認だけを明示的に省略する場合は `python tools/debug_check.py --allow-browser-skip` を使用します。
 
 画像基準を意図的なUI変更に合わせて更新する場合だけ、`python tools/ui_visual_check.py --update-baselines` を実行してください。通常実行は `tests/visual_baselines/` と比較し、終了時に対象ブラウザを元のNORMAL/DEBUG環境へ戻します。複数ブラウザが接続されている場合、`tools/browser_smoke.py --client-id <id>` で対象を明示します。
 
@@ -92,17 +92,17 @@ PDF選択、小型プロンプト5件、小型JSON Schema 5件、出力分離、
 
 ## 実PDF 1件のOllama検証
 
-`DEBUG: ローカルLLM 1件実証` は `JPA 2026066788-000000.pdf` だけを対象にします。再実行は既存結果を保護するため既定で拒否されます。
+実PDFを使う単一文献検証データはGitに含めません。`debug_data/researches/` にローカル検証用リサーチを作成し、対応PDFを `patent_pool/` に配置してから、リサーチIDを明示して実行します。再実行は既存結果を保護するため既定で拒否されます。
 
 ```powershell
-& "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -X utf8 tools\run_single_llm_test.py
+python tools\run_single_llm_test.py --research-id <debug_research_id>
 ```
 
 処理はPDF抽出、`gemma4:e4b` の構造化分析、`qwen3-embedding:8b` の2要約Embedding、型・値域・空応答・次元検証、原子的な結果確定の順です。`gemma4:e4b` はOllamaのJSON Schema grammarを受理しないため、モデルはJSONモードで実行し、より厳密なSchemaをPython側で検証します。
 
 成果物:
 
-- UI用結果: `debug_data/researches/debug_llm_single/results/<patent-id>.json`
+- UI用結果: `debug_data/researches/<debug_research_id>/results/<patent-id>.json`
 - 実行監査: 同フォルダ階層の `runs/<run-id>/run_manifest.json`
 - 抽出情報・テキスト・プロンプト・生成応答・Embedding応答: 同じrunフォルダ
 
@@ -117,9 +117,9 @@ PDF選択、小型プロンプト5件、小型JSON Schema 5件、出力分離、
 文献別の生成LLMは通常、従来どおり4回です。類似度と権利範囲の広さは根拠となる構成要件ID、課題要約は根拠段落ID、技術要約は構成要件または段落IDを小さな配列で返します。Pythonは各IDがそのタスクのEvidence Packへ実際に含まれていたかを検証します。不一致なら、そのタスクだけ候補IDを限定して1回自動再生成するため、その文献は5回以上になることがあります。再生成も不一致なら文献を失敗扱いにし、検証過程とrun単位の検証率を記録します。
 
 ```powershell
-python tools/run_research_pipeline.py laser_process_landscape --stage plan
-python tools/run_research_pipeline.py laser_process_landscape --stage prepare
-python tools/run_research_pipeline.py laser_process_landscape --stage execute
+python tools/run_research_pipeline.py <research_id> --stage plan
+python tools/run_research_pipeline.py <research_id> --stage prepare
+python tools/run_research_pipeline.py <research_id> --stage execute
 ```
 
 共有抽出キャッシュは `runtime/shared/extractions/` に置きます。抽出全文・ページ別本文に加え、PDFだけで決まる章・段落・請求項・構成要件の構造化結果もPDFハッシュ単位で共有します。自社技術や読取方針に依存するEvidence Packと分析結果はリサーチ別に保存します。元PDFを常に正とし、リサーチ／文献ごとに再抽出や全文読解を選べます。脅威マップは従来どおり「自社技術との類似度 × 権利範囲の広さ」の5×5です。詳細は [docs/RESEARCH_PIPELINE_DESIGN.md](docs/RESEARCH_PIPELINE_DESIGN.md) を参照してください。
@@ -134,7 +134,7 @@ PDFテキスト抽出と章・請求項構造化だけを先に行う場合は�
 
 ## リサーチ追加
 
-画面の `リサーチ管理` から、名前、ID、説明、自社技術、`patent_list_{yyyymmddHHMMSS}.csv` を登録する。CSVはCP932・既定11列を事前検証し、PDF一致・未発見・複数候補・警告件数を表示してから保存する。
+画面の `リサーチ管理` から、名前、ID、説明、自社技術、`patent_list_{yyyymmddHHMMSS}.csv` を登録する。CSVはCP932・既定11列を事前検証し、PDF一致・未発見・複数候補・警告件数を表示してから保存する。作成された `researches/<research_id>/` は本番運用データであり、Gitには追加しない。
 
 同じリサーチへCSVを追加した場合、ファイル名のタイムスタンプが最新の1件だけを採用し、旧CSVは履歴として保持する。最新版が切り替わると分析状態は「再分析必要」となり、夜間一括分析で全件再分析を完了するまで解除されない。夜間一括分析画面では使用中リサーチを選択できる。
 
@@ -150,14 +150,15 @@ PDFファイル名は従来の `JPA ...` / `JPB ...` に加え、`WO20xx-XXXXXX`
 
 ## Git管理するデータの境界
 
-GitHubには、再現可能なアプリ本体、テスト、スキーマ、プロンプト、リサーチ参照リストを保存します。`debug_laser_demo` はDEBUG環境をすぐ検証できる固定フィクスチャなのでコミット対象です。
+GitHubには、再現可能なアプリ本体、テスト、スキーマ、プロンプト、セットアップ資料だけを保存します。NORMALリサーチのCSV、自社技術定義、分析結果は保存しません。`debug_laser_demo` は架空の名称・評価を使ったDEBUG環境の固定回帰fixtureなので、例外的にコミット対象です。
 
 次のローカル資産・生成物は `.gitignore` で除外します。
 
 - `patent_pool/` の特許明細書PDF（ディレクトリを保持する `.gitkeep` のみ管理）
+- `researches/` のNORMALリサーチ入力、自社技術定義、CSV、全生成物（ディレクトリを保持する `.gitkeep` のみ管理）
 - `old_source/` と、構築時に参照した旧仕様・旧UI設計文書
-- 通常リサーチの `results/`、`runs/`
-- `debug_llm_single` の抽出本文、プロンプト、Ollama応答、embedding、実行監査
+- 固定fixture以外の `debug_data/researches/` 入力と生成物
+- 実PDF検証の抽出本文、プロンプト、Ollama応答、Embedding、実行監査
 - `runtime/`、ログ、Pythonキャッシュ、一時ファイル
 
 DEBUG用の固定フィクスチャと、LLM実行で生成されるデバッグ成果物は区別します。前者は回帰確認に必要なため管理し、後者はPDF由来の本文を含み得るためローカルにだけ保存します。

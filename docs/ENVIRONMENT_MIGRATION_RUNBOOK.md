@@ -55,44 +55,36 @@ Codexは次の規則を守る。
 
 本番PDFはGitでは運ばない。利用権限を確認したうえで、承認された保管元から本番端末の `patent_pool/` へ別経路で配置する。分析結果は本番端末で作り直す。
 
-### 3.2 現行release候補に含まれるリサーチ入力
+### 3.2 releaseに含まれるリサーチ入力
 
-現在のGit追跡対象には、NORMALリサーチの入力定義が含まれる。
+GitのreleaseにはNORMALリサーチの入力を含めない。`researches/` は `.gitkeep` だけを追跡し、次はすべて本番端末のローカル運用データとして扱う。
 
-```text
-researches/laser_process_landscape/
-├── research.json
-├── company_tech.txt
-└── patent_list_20260716224533.csv
-```
+- `research.json`
+- `company_tech.txt`
+- `patent_list_*.csv`
+- `organization_overrides.json`
+- `results/`, `runs/`, `pipeline/`, `clustering/`
 
-このCSVは112文献である。したがって、新規clone後のSQLiteは「リサーチ0件・文献0件」にはならず、最初の同期で原則として次になる。
-
-- NORMALリサーチ: 1件
-- 文献メタデータ: 112件
-- PDF: `patent_pool/` に配置した件数
-- PDFがない文献: UIには残るが、分析状態は `skipped / pdf_not_found`
-- 分析結果、Embedding: 本番で分析するまでは0件
-
-本番でこのリサーチを使用する場合は、CSVに対応する承認済みPDFを `patent_pool/` へ配置する。本当に空のNORMAL環境から始める場合は、追跡済みリサーチ入力を含まない専用releaseを作ること。移行先だけで追跡済みフォルダを削除し、同じrelease名のまま別構成にしてはならない。
+したがって、新規clone後の初回SQLite同期はNORMALリサーチ0件・文献0件が正しい。本番リサーチは、承認されたPDF、CSV、自社技術定義を本番端末へ配置してからUIで新規作成する。開発・検証端末のリサーチフォルダをコピーしたり、Gitへ追加したりしない。
 
 ### 3.3 Git管理境界
 
 | 種類 | Git | 本番への渡し方 |
 |---|---:|---|
 | `src/`, `public/`, `tools/`, `scripts/`, `schemas/`, `docs/`, `tests/` | 対象 | release commit/tag |
-| DEBUG固定フィクスチャ | 対象 | release commit/tag |
-| リサーチの `research.json`, `company_tech.txt`, 採用CSV | 現状は対象 | release commit/tag |
+| 合成DEBUG固定fixture | 対象 | release commit/tag |
+| NORMALリサーチ入力・自社技術・採用CSV | 対象外 | 本番端末で新規作成 |
+| 固定fixture以外のDEBUG入力 | 対象外 | 検証端末でローカル作成 |
 | `patent_pool/*.pdf` | 対象外 | 承認済み保管元から別経路 |
 | SQLite DB、`runtime/` | 対象外 | 移行せず本番で生成 |
 | `results/`, `runs/`, `pipeline/`, `clustering/` | 対象外 | 移行せず本番で生成 |
 | `.codex/mcp.local.json` | 対象外 | 本番端末で生成 |
-| 企業グループ共通設定 | 運用判断 | `config/organization_registry.json` を承認済み設定としてreleaseに含めるか、本番資産としてバックアップするかを明記 |
-| リサーチ別企業グループ | 運用判断 | `organization_overrides.json` の管理方針をリサーチ単位で明記 |
+| 企業グループ共通設定 | 対象外 | `config/organization_registry.json` を本番資産としてバックアップ |
+| リサーチ別企業グループ | 対象外 | `organization_overrides.json` をリサーチと一緒にバックアップ |
 
 ## 4. 現在の検証済み環境スナップショット
 
-以下は2026-07-26時点の開発・検証端末の実測値であり、新端末の絶対要件ではない。新端末では同じ項目を実測し、差分を環境台帳へ記録する。
+以下は2026-07-26時点の開発・検証端末の実測値であり、新端末の絶対要件ではない。新端末では同じ項目を実測し、差分を環境台帳へ記録する。この節は互換性と容量計画の参考情報だけを扱い、リサーチID、CSV、特許番号、分析内容、生成結果は参照しない。
 
 ### 4.1 OS・実行基盤
 
@@ -158,25 +150,19 @@ researches/laser_process_landscape/
 
 20,000 MiB以上のVRAMかつ64 GiB以上のRAMがある場合だけ、永続シャードモードが自動選択される。現在端末はこの条件を満たさない。大規模本番処理では、24 GB級以上のGPUと64 GB以上のRAMを推奨し、実際の採用値は必ず `/api/health` と `run_manifest.json` で確認する。
 
-### 4.5 現在のNORMALデータ
+### 4.5 releaseのNORMALデータ境界
 
-2026-07-26時点のSQLite検証結果:
+releaseにはNORMALの入力・DB・分析結果を含めない。新規clone直後の期待値は次のとおり。
 
-| 項目 | 現在値 |
+| 項目 | 期待値 |
 |---|---:|
-| DB | `runtime/normal/patent_viewer.sqlite3` |
-| DBサイズ | 49,160,192 bytes |
-| リサーチ | 1 |
-| 文献 | 112 |
-| Embedding | 112 |
-| artifact records | 2,859 |
-| interpretation | 0 |
-| `PRAGMA integrity_check` | `ok` |
-| 欠損payload | 0 |
-| 不正vector | 0 |
-| 孤立vector | 0 |
+| リサーチ | 0 |
+| 文献 | 0 |
+| PDF | 0 |
+| Embedding | 0 |
+| artifact records | 0 |
 
-このDBと件数は開発端末の実行結果であり、本番端末へコピーしない。本番初回分析後の比較参考値としてのみ使用する。
+開発・検証端末の件数やSQLite実測値はrelease資料へ固定せず、各端末の環境台帳・受入記録にだけ保存する。
 
 ## 5. Phase 0: 開発端末で本番releaseを確定する
 
@@ -191,8 +177,7 @@ researches/laser_process_landscape/
 - [ ] 本番用commitまたはtagを作る
 - [ ] commit、tag、作成日時を移行台帳へ記録する
 
-現在の作業ツリーは未コミット変更を含むため、2026-07-26時点のbase commit
-`4f23903d922f4cfc963bb8a6dbf39c8c72267be9` をそのまま本番revisionとして扱わない。最終修正をコミットした後のcommit/tagを使用する。
+本番では、データ境界の確認と検証を完了したcommitまたはrelease tagを使用する。文書へ固定された過去のcommit SHAを本番revisionとして流用しない。
 
 確認コマンド:
 
@@ -321,13 +306,12 @@ PatentViewerは起動時に既存の11434番Ollamaを再利用せず、空きloc
 
 ## 9. Phase 4: PDFとリサーチ入力を配置する
 
-### 9.1 現行リサーチを本番で再分析する場合
+### 9.1 本番PDFを配置する
 
-1. Gitから `researches/laser_process_landscape` の3入力ファイルが取得済みであることを確認する。
-2. 承認された112 PDFを `patent_pool/` 直下へ配置する。
-3. PDF拡張子は `.pdf` とし、ファイル名はCSV照合規則に従う。
-4. ファイル数だけでなくSHA-256一覧を移行台帳へ保存する。
-5. CSVはCP932、BOMなし、CRLF、11列であることを確認する。
+1. 利用権限を確認した本番PDFだけを `patent_pool/` 直下へ配置する。
+2. PDF拡張子は `.pdf` とし、ファイル名はCSV照合規則に従う。
+3. ファイル数だけでなくSHA-256一覧を移行台帳へ保存する。
+4. 開発・検証端末のPDFが混在していないことを確認する。
 
 PDF一覧の記録例:
 
@@ -340,13 +324,14 @@ Get-ChildItem -LiteralPath .\patent_pool -Filter *.pdf -File |
 
 `patent-pool-manifest.csv` はPDF情報を含む運用台帳としてGitへ追加しない。
 
-### 9.2 新しい本番リサーチを作る場合
+### 9.2 新しい本番リサーチを作る
 
 1. PDFを先に `patent_pool/` へ配置する。
 2. UIの「リサーチ管理」から、名前、ID、説明、自社技術、CSVを登録する。
 3. CSV名を `patent_list_yyyymmddHHMMSS.csv` にする。
 4. PDF一致、未発見、複数候補、警告を保存前に確認する。
 5. 出願人グラフと企業ランキングを使う場合は、CSVの `出願人・権利者名` が空欄でないことを確認する。
+6. 作成された `researches/<research_id>/` をGitへ追加しない。
 
 CSVの正確な物理・列仕様は [PATENT_LIST_CSV_SPEC.md](PATENT_LIST_CSV_SPEC.md) を正とする。
 
@@ -390,7 +375,8 @@ python tools/migrate_to_sqlite.py --environment normal --verify-only --json
 - [ ] `missing_payloads = 0`
 - [ ] `invalid_vectors = 0`
 - [ ] `orphan_vectors = 0`
-- [ ] 現行リサーチを使う場合、NORMAL `researches = 1`, `documents = 112`
+- [ ] 本番リサーチ作成前はNORMAL `researches = 0`, `documents = 0`
+- [ ] 本番リサーチ作成後は、UI件数が承認済みCSVの行数と一致する
 - [ ] PDF配置後、UIのPDF POOL件数と配置件数が一致する
 
 PDFをSQLite初回同期後に追加した場合も、PDFプールの更新時刻が署名へ含まれるため次回同期対象になる。確実に再構築する場合は、分析ジョブとサーバーを停止したうえで次を使う。
@@ -657,8 +643,8 @@ SQLite integrity:
 doctor:
 UI acceptance:
 LLM preflight:
-sample prepare:
-sample execute:
+pilot prepare:
+pilot execute:
 human quality approval:
 
 full run approval:

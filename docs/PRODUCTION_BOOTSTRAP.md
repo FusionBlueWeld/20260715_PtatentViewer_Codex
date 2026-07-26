@@ -1,7 +1,7 @@
 # 本番端末の新規構築手順
 
-> **現行の正本:** 新しい端末・Codex環境の具体的な構築、現行Gitに含まれる
-> 112文献のリサーチ入力、環境台帳、受入条件、障害対応は
+> **現行の正本:** 新しい端末・Codex環境の具体的な構築、空のNORMAL環境、
+> 環境台帳、受入条件、障害対応は
 > [`ENVIRONMENT_MIGRATION_RUNBOOK.md`](ENVIRONMENT_MIGRATION_RUNBOOK.md)
 > を使用する。この文書はデータ境界の基本方針を補足する。
 
@@ -9,7 +9,7 @@
 
 この文書は、別端末のCodexがPatentViewerの本番環境を新規構築するときの作業指示である。
 
-この文書は、NORMALリサーチ入力を含まない専用releaseを使い、完全な空状態から始める場合の補足資料である。現行release候補には112文献のリサーチ入力がGit追跡対象として含まれるため、そのまま移行する場合は
+この文書は、NORMALリサーチ入力を含まないreleaseを使い、完全な空状態から始める場合の補足資料である。具体的な手順は
 [`ENVIRONMENT_MIGRATION_RUNBOOK.md`](ENVIRONMENT_MIGRATION_RUNBOOK.md)
 を正とする。
 
@@ -25,7 +25,7 @@
 
 移行先では、Codexに次のように依頼する。
 
-> このリポジトリの `docs/ENVIRONMENT_MIGRATION_RUNBOOK.md` を最後まで読み、Phase 0から順番に本番環境を構築してください。空環境用releaseを使う場合だけ `docs/PRODUCTION_BOOTSTRAP.md` の追加条件も適用してください。実行前に現在の実装と文書の差分を確認し、未実装のコマンドを存在するものとして扱わないでください。
+> このリポジトリの `docs/ENVIRONMENT_MIGRATION_RUNBOOK.md` を最後まで読み、Phase 0から順番に空のNORMAL環境を構築してください。`docs/PRODUCTION_BOOTSTRAP.md` のデータ境界も確認してください。実行前に現在の実装と文書の差分を確認し、未実装のコマンドを存在するものとして扱わないでください。
 
 Codexは、作業開始時にこの文書だけでなく、`README.md`、`docs/CODEX_COLLABORATION.md`、`.gitignore`、`requirements.txt`、実際の起動・DB初期化コードも確認すること。
 
@@ -45,6 +45,9 @@ Codexは、作業開始時にこの文書だけでなく、`README.md`、`docs/C
 - 抽出本文、Embedding、LLM要求・応答、監査ログ
 - `.codex/mcp.local.json`
 - `runtime/server-control.json`
+- `researches/` のNORMALリサーチ入力、自社技術定義、CSV、生成物
+- 固定fixture以外の `debug_data/researches/`
+- `config/organization_registry.json` とリサーチ別企業グループ設定
 
 `.codex/mcp.local.json` と `runtime/server-control.json` は端末固有情報を含むため、本番端末で再生成する。
 
@@ -114,7 +117,7 @@ python -m pip install -r requirements.txt
 python tools/migrate_to_sqlite.py --environment normal --verify-only
 ```
 
-空環境用releaseで期待する結果は次のとおり。現行の112文献リサーチ入力を含むreleaseには、この0件条件を適用しない。
+releaseで期待する初期状態は次のとおり。
 
 - 本番用SQLite DBが新規作成される。
 - スキーマが最新バージョンになる。

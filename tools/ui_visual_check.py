@@ -16,6 +16,7 @@ ROOT = Path(__file__).parents[1].resolve()
 sys.path.insert(0, str(ROOT / "src"))
 
 from patent_viewer.collaboration_client import PatentViewerClient
+from synthetic_fixture import synthetic_debug_pdfs
 
 
 BASELINES = ROOT / "tests" / "visual_baselines"
@@ -143,66 +144,67 @@ def main() -> int:
     original_environment = "normal"
     client_id = ""
     results = {}
-    try:
-        if args.url:
-            url, token = args.url, args.token or ""
-        else:
-            url, token, process = start_server()
-        client = PatentViewerClient(ROOT, url, token)
-        CURRENT.mkdir(parents=True, exist_ok=True)
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(executable_path=str(executable), headless=True)
-            page = browser.new_page(viewport=VIEWPORTS["wide"])
-            try:
-                page.goto(url, wait_until="domcontentloaded")
-                page.wait_for_function("document.querySelector('#metric-total')?.textContent.includes('total')")
-                client_id = page.evaluate("sessionStorage.getItem('patentViewerClientId')")
-                registered = wait_registered(client, client_id)
-                original_environment = registered["environment"]
-                if original_environment != "debug":
-                    client.switch_environment(client_id, "debug")
-                    page.wait_for_function("document.body.dataset.environment === 'debug'", timeout=15_000)
-                    page.wait_for_function("document.querySelector('#metric-total')?.textContent.includes('total')")
-                    wait_client(client, client_id, "debug")
-
-                for name, viewport in VIEWPORTS.items():
-                    page.set_viewport_size(viewport)
-                    page.wait_for_timeout(150)
-                    current = CURRENT / f"patent-viewer-{name}.png"
-                    baseline = BASELINES / current.name
-                    page.screenshot(path=str(current), full_page=False, animations="disabled")
-                    if args.update_baselines:
-                        BASELINES.mkdir(parents=True, exist_ok=True)
-                        shutil.copyfile(current, baseline)
-                        results[name] = {"ok": True, "updated": True}
-                    elif not baseline.exists():
-                        results[name] = {"ok": False, "reason": "baseline_missing", "path": str(baseline)}
-                    else:
-                        results[name] = compare_images(
-                            baseline, current, max(0, min(args.pixel_threshold, 255)),
-                            max(0.0, min(args.max_changed_fraction, 1.0)),
-                        )
-                if not all(item["ok"] for item in results.values()):
-                    print(json.dumps({"ok": False, "results": results}, ensure_ascii=False, indent=2), file=sys.stderr)
-                    return 1
-            finally:
+    with synthetic_debug_pdfs(ROOT):
+        try:
+            if args.url:
+                url, token = args.url, args.token or ""
+            else:
+                url, token, process = start_server()
+            client = PatentViewerClient(ROOT, url, token)
+            CURRENT.mkdir(parents=True, exist_ok=True)
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(executable_path=str(executable), headless=True)
+                page = browser.new_page(viewport=VIEWPORTS["wide"])
                 try:
-                    if client_id and original_environment != "debug":
-                        client.switch_environment(client_id, original_environment)
-                        page.wait_for_function(
-                            f"document.body.dataset.environment === {json.dumps(original_environment)}",
-                            timeout=15_000,
-                        )
-                        wait_client(client, client_id, original_environment)
+                    page.goto(url, wait_until="domcontentloaded")
+                    page.wait_for_function("document.querySelector('#metric-total')?.textContent.includes('total')")
+                    client_id = page.evaluate("sessionStorage.getItem('patentViewerClientId')")
+                    registered = wait_registered(client, client_id)
+                    original_environment = registered["environment"]
+                    if original_environment != "debug":
+                        client.switch_environment(client_id, "debug")
+                        page.wait_for_function("document.body.dataset.environment === 'debug'", timeout=15_000)
+                        page.wait_for_function("document.querySelector('#metric-total')?.textContent.includes('total')")
+                        wait_client(client, client_id, "debug")
+
+                    for name, viewport in VIEWPORTS.items():
+                        page.set_viewport_size(viewport)
+                        page.wait_for_timeout(150)
+                        current = CURRENT / f"patent-viewer-{name}.png"
+                        baseline = BASELINES / current.name
+                        page.screenshot(path=str(current), full_page=False, animations="disabled")
+                        if args.update_baselines:
+                            BASELINES.mkdir(parents=True, exist_ok=True)
+                            shutil.copyfile(current, baseline)
+                            results[name] = {"ok": True, "updated": True}
+                        elif not baseline.exists():
+                            results[name] = {"ok": False, "reason": "baseline_missing", "path": str(baseline)}
+                        else:
+                            results[name] = compare_images(
+                                baseline, current, max(0, min(args.pixel_threshold, 255)),
+                                max(0.0, min(args.max_changed_fraction, 1.0)),
+                            )
+                    if not all(item["ok"] for item in results.values()):
+                        print(json.dumps({"ok": False, "results": results}, ensure_ascii=False, indent=2), file=sys.stderr)
+                        return 1
                 finally:
-                    browser.close()
-    finally:
-        if process is not None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
+                    try:
+                        if client_id and original_environment != "debug":
+                            client.switch_environment(client_id, original_environment)
+                            page.wait_for_function(
+                                f"document.body.dataset.environment === {json.dumps(original_environment)}",
+                                timeout=15_000,
+                            )
+                            wait_client(client, client_id, original_environment)
+                    finally:
+                        browser.close()
+        finally:
+            if process is not None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
     print(json.dumps({"ok": True, "results": results, "restored_environment": original_environment}, ensure_ascii=False))
     return 0
 

@@ -22,7 +22,6 @@ sys.path.insert(0, str(ROOT / "src"))
 from patent_viewer.domain import ANALYSIS_REQUIRED, Repository, patent_key, read_json
 
 
-DEFAULT_RESEARCH = "debug_llm_single"
 GENERATION_MODEL = "gemma4:e4b"
 EMBEDDING_MODEL = "qwen3-embedding:8b"
 OLLAMA_URL = "http://127.0.0.1:11434"
@@ -232,7 +231,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="DEBUG環境で実PDF 1件をOllama分析する")
-    parser.add_argument("--research-id", default=DEFAULT_RESEARCH)
+    parser.add_argument(
+        "--research-id",
+        required=True,
+        help="debug_data/researches/ 配下にローカル作成した検証用リサーチID",
+    )
     parser.add_argument("--generation-model", default=GENERATION_MODEL)
     parser.add_argument("--embedding-model", default=EMBEDDING_MODEL)
     parser.add_argument("--timeout", type=int, default=900)
